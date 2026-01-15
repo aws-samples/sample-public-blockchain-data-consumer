@@ -5,7 +5,7 @@ Automatically discover and catalog blockchain data from the [AWS Public Blockcha
 **Key Features:**
 - Zero manual schema definition — crawlers infer schemas from Parquet files
 - Automatic discovery of new blockchains on a configurable schedule
-- Separate Glue database per blockchain (btc, eth, ton, stellar_pubnet, etc.)
+- Separate Glue database per blockchain (aws_bitcoin_mainnet, aws_ethereum_mainnet, ton_mainnet, stellar_pubnet, etc.)
 - Configurable crawler schedules (hourly, daily, weekly, or disabled)
 - SNS notifications on discovery and crawler completion
 - Automatic cleanup of Glue resources on stack deletion
@@ -196,13 +196,13 @@ Once crawlers complete (check the Glue console or wait for SNS notification):
 SHOW DATABASES;
 
 -- List tables in a blockchain database
-SHOW TABLES IN btc;
+SHOW TABLES IN aws_bitcoin_mainnet;
 
 -- Query Bitcoin blocks
-SELECT * FROM btc.blocks WHERE date = '2024-01-01' LIMIT 10;
+SELECT * FROM aws_bitcoin_mainnet.blocks WHERE date = '2024-01-01' LIMIT 10;
 
 -- Query Ethereum transactions
-SELECT * FROM eth.transactions WHERE date = '2024-01-01' LIMIT 10;
+SELECT * FROM aws_ethereum_mainnet.transactions WHERE date = '2024-01-01' LIMIT 10;
 ```
 
 Use the `AWSPublicBlockchain` workgroup in Athena for queries.
@@ -236,7 +236,7 @@ Use the `AWSPublicBlockchain` workgroup in Athena for queries.
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                   AWS Glue Data Catalog                      │
-│           btc | eth | ton | stellar_pubnet | ...            │
+│  aws_bitcoin_mainnet | aws_ethereum_mainnet | ton_mainnet | ...│
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -271,7 +271,7 @@ Crawlers use Glue's native scheduling. The default schedule is set at deployment
 ### View Crawler Schedule
 
 ```bash
-aws glue get-crawler --name blockchain-crawlers-BTC-Crawler \
+aws glue get-crawler --name blockchain-crawlers-AWS_BITCOIN_MAINNET-Crawler \
   --query 'Crawler.Schedule' --output json
 ```
 
@@ -280,17 +280,17 @@ aws glue get-crawler --name blockchain-crawlers-BTC-Crawler \
 ```bash
 # Set to hourly
 aws glue update-crawler \
-  --name blockchain-crawlers-BTC-Crawler \
+  --name blockchain-crawlers-AWS_BITCOIN_MAINNET-Crawler \
   --schedule "cron(0 * * * ? *)"
 
 # Set to daily (midnight UTC)
 aws glue update-crawler \
-  --name blockchain-crawlers-ETH-Crawler \
+  --name blockchain-crawlers-AWS_ETHEREUM_MAINNET-Crawler \
   --schedule "cron(0 0 * * ? *)"
 
 # Set to weekly (Sunday midnight UTC)
 aws glue update-crawler \
-  --name blockchain-crawlers-TON-Crawler \
+  --name blockchain-crawlers-TON_MAINNET-Crawler \
   --schedule "cron(0 0 ? * SUN *)"
 ```
 
@@ -298,14 +298,14 @@ aws glue update-crawler \
 
 ```bash
 aws glue update-crawler \
-  --name blockchain-crawlers-BTC-Crawler \
+  --name blockchain-crawlers-AWS_BITCOIN_MAINNET-Crawler \
   --schedule ""
 ```
 
 ### Manually Trigger a Crawler
 
 ```bash
-aws glue start-crawler --name blockchain-crawlers-BTC-Crawler
+aws glue start-crawler --name blockchain-crawlers-AWS_BITCOIN_MAINNET-Crawler
 ```
 
 ### List All Crawlers
@@ -393,7 +393,7 @@ aws s3 rb s3://<athena-results-bucket-name> --force
 
 ```bash
 # Check crawler state and schedule
-aws glue get-crawler --name blockchain-crawlers-BTC-Crawler \
+aws glue get-crawler --name blockchain-crawlers-AWS_BITCOIN_MAINNET-Crawler \
   --query 'Crawler.{State:State,Schedule:Schedule}' --output json
 ```
 

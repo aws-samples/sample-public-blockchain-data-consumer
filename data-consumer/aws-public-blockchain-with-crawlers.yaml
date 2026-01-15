@@ -189,446 +189,144 @@ Resources:
           DEFAULT_CRAWLER_SCHEDULE: !Ref DefaultCrawlerSchedule
       Code:
         ZipFile: |
-          import boto3
-          import json
-          import os
+          import boto3, json, os
+          glue, s3, sns = boto3.client('glue'), boto3.client('s3'), boto3.client('sns')
+          SCHEDULE_MAP = {'hourly': 'cron(0 * * * ? *)', 'daily': 'cron(0 0 * * ? *)', 'weekly': 'cron(0 0 ? * SUN *)', 'disabled': None}
+          MANIFEST_FILE = 'manifest.json'
           
-          glue = boto3.client('glue')
-          s3 = boto3.client('s3')
-          sns = boto3.client('sns')
+          def discover_from_manifest(bucket):
+              """Fetch manifest.json for chain discovery. Returns {name: {path, description}} or None."""
+              try:
+                  resp = s3.get_object(Bucket=bucket, Key=MANIFEST_FILE, RequestPayer='requester')
+                  manifest = json.loads(resp['Body'].read().decode('utf-8'))
+                  if 'chains' not in manifest: return None
+                  discovered = {}
+                  for chain in manifest['chains']:
+                      if 'name' not in chain or 'path' not in chain: continue
+                      name = chain['name'].lower()
+                      discovered[name] = {'path': f"s3://{bucket}/{chain['path']}", 'description': chain.get('description', f"Blockchain data for {name}")}
+                      print(f"Manifest: {name} at {discovered[name]['path']}")
+                  return discovered if discovered else None
+              except Exception as e:
+                  print(f"Manifest error: {e}")
+                  return None
           
-          SCHEDULE_MAP = {
-              'hourly': 'cron(0 * * * ? *)',
-              'daily': 'cron(0 0 * * ? *)',
-              'weekly': 'cron(0 0 ? * SUN *)',
-              'disabled': None
-          }
-          
-          # Common blockchain table names - if a folder contains these, it's a blockchain
-          BLOCKCHAIN_TABLE_INDICATORS = {
-              'blocks', 'transactions', 'logs', 'traces', 'token_transfers',
-              'contracts', 'receipts', 'events', 'transfers', 'balances',
-              'accounts', 'messages', 'operations', 'ledgers', 'payments'
-          }
-          
-          # Network type indicators (e.g., Stellar has pubnet/testnet)
-          NETWORK_INDICATORS = {'pubnet', 'testnet', 'mainnet', 'devnet'}
-          
-          # Intermediate folders to skip through (not blockchains themselves)
-          # When we find 'parquet', we crawl ONLY that folder, ignoring siblings like 'ledgers'
-          PARQUET_FOLDER = 'parquet'
-          INTERMEDIATE_FOLDERS = {'data', 'raw', 'processed'}
-          
-          # Version folders that indicate the table root (contains date= partitions directly)
-          VERSION_FOLDER_PATTERN = {'v1', 'v2', 'v3', 'v4', 'v5'}
+          TABLE_INDICATORS = {'blocks','transactions','logs','traces','token_transfers','contracts','receipts','events','transfers','balances','accounts','messages','operations','ledgers','payments'}
+          NETWORK_INDICATORS = {'pubnet','testnet','mainnet','devnet'}
+          VERSION_FOLDERS = {'v1','v2','v3','v4','v5'}
           
           def has_hive_partitions(bucket, prefix):
-              """
-              Check if a folder contains Hive-style partitions (key=value format).
-              This indicates the folder is a table root, not a table itself.
-              """
               try:
-                  response = s3.list_objects_v2(
-                      Bucket=bucket,
-                      Prefix=prefix,
-                      Delimiter='/',
-                      MaxKeys=10,
-                      RequestPayer='requester'
-                  )
-                  for common_prefix in response.get('CommonPrefixes', []):
-                      folder_name = common_prefix['Prefix'].rstrip('/').split('/')[-1]
-                      # Hive partition format: key=value (e.g., date=2024-01-01)
-                      if '=' in folder_name:
-                          return True
-                  return False
-              except Exception as e:
-                  print(f"Error checking for Hive partitions in {prefix}: {e}")
-                  return False
+                  resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter='/', MaxKeys=10, RequestPayer='requester')
+                  return any('=' in p['Prefix'].rstrip('/').split('/')[-1] for p in resp.get('CommonPrefixes', []))
+              except: return False
           
           def is_blockchain_folder(bucket, prefix):
-              """
-              Determine if a folder contains blockchain data vs being a vendor namespace.
-              A blockchain folder typically contains table subfolders (blocks, transactions, etc.)
-              or parquet files directly, or version folders (v1, v2) with date partitions.
-              
-              IMPORTANT: If a 'parquet' folder exists alongside other folders (like 'ledgers'),
-              this is NOT a simple blockchain folder - it needs deeper scanning to handle
-              the parquet/network/version structure (e.g., Stellar).
-              """
               try:
-                  response = s3.list_objects_v2(
-                      Bucket=bucket,
-                      Prefix=prefix,
-                      Delimiter='/',
-                      MaxKeys=20,
-                      RequestPayer='requester'
-                  )
-                  
-                  # Check for parquet files directly in this folder
-                  for obj in response.get('Contents', []):
-                      if obj['Key'].endswith('.parquet'):
-                          return True
-                  
-                  # First, check if 'parquet' folder exists - if so, this needs deeper scanning
-                  subfolders = []
-                  for common_prefix in response.get('CommonPrefixes', []):
-                      folder_name = common_prefix['Prefix'].rstrip('/').split('/')[-1].lower()
-                      subfolders.append(folder_name)
-                      if folder_name == PARQUET_FOLDER:
-                          # Has parquet folder - NOT a simple blockchain, needs scan_for_blockchains
-                          return False
-                  
-                  # Check subfolders for blockchain table indicators or version folders
-                  for folder_name in subfolders:
-                      if folder_name in BLOCKCHAIN_TABLE_INDICATORS:
-                          return True
-                      # Check for version folders (v1, v2, etc.) - these are table roots
-                      if folder_name in VERSION_FOLDER_PATTERN:
-                          return True
-                      # Check for date partition pattern (date=YYYY-MM-DD)
-                      if folder_name.startswith('date='):
-                          return True
-                  
-                  return False
-              except Exception as e:
-                  print(f"Error checking if blockchain folder {prefix}: {e}")
-                  return False
+                  resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter='/', MaxKeys=20, RequestPayer='requester')
+                  if any(o['Key'].endswith('.parquet') for o in resp.get('Contents', [])): return True
+                  subfolders = [p['Prefix'].rstrip('/').split('/')[-1].lower() for p in resp.get('CommonPrefixes', [])]
+                  if 'parquet' in subfolders: return False
+                  return any(f in TABLE_INDICATORS or f in VERSION_FOLDERS or f.startswith('date=') for f in subfolders)
+              except: return False
           
           def scan_for_blockchains(bucket, prefix, base_name, discovered, paginator, depth=0):
-              """
-              Recursively scan for blockchain data, handling nested structures like:
-              - v1.1/stellar/parquet/pubnet/v1/date=.../
-              - v1.1/stellar/parquet/testnet/v1/date=.../
-              
-              When a 'parquet' folder exists, we ONLY crawl that folder and ignore
-              sibling folders (like 'ledgers' which may contain raw XDR files).
-              
-              For Stellar-style structures where version folders (v1, v2) contain
-              Hive-style date partitions directly, we set the crawler path at the 
-              version folder level so Glue recognizes it as a single partitioned table.
-              
-              Args:
-                  bucket: S3 bucket name
-                  prefix: Current S3 prefix to scan
-                  base_name: Base blockchain name (e.g., 'stellar')
-                  discovered: Dict to add discovered blockchains to
-                  paginator: S3 paginator
-                  depth: Current recursion depth (max 5 to prevent infinite loops)
-              """
-              if depth > 5:
-                  return
-              
+              if depth > 5: return
               try:
-                  pages = paginator.paginate(
-                      Bucket=bucket,
-                      Prefix=prefix,
-                      Delimiter='/',
-                      RequestPayer='requester'
-                  )
-                  
-                  # First pass: collect all prefixes and check for parquet folder
-                  all_prefixes = []
-                  has_parquet_folder = False
-                  parquet_prefix = None
-                  
-                  for page in pages:
-                      for prefix_obj in page.get('CommonPrefixes', []):
-                          sub_prefix = prefix_obj['Prefix']
-                          folder_name = sub_prefix.rstrip('/').split('/')[-1].lower()
-                          all_prefixes.append((sub_prefix, folder_name))
-                          if folder_name == PARQUET_FOLDER:
-                              has_parquet_folder = True
-                              parquet_prefix = sub_prefix
-                  
-                  # If parquet folder exists, ONLY process that (skip siblings like 'ledgers')
-                  if has_parquet_folder:
-                      print(f"  Found parquet folder, scanning only: {parquet_prefix}")
-                      scan_for_blockchains(bucket, parquet_prefix, base_name, discovered, paginator, depth + 1)
+                  all_prefixes, parquet_prefix = [], None
+                  for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/', RequestPayer='requester'):
+                      for p in page.get('CommonPrefixes', []):
+                          folder = p['Prefix'].rstrip('/').split('/')[-1].lower()
+                          all_prefixes.append((p['Prefix'], folder))
+                          if folder == 'parquet': parquet_prefix = p['Prefix']
+                  if parquet_prefix:
+                      scan_for_blockchains(bucket, parquet_prefix, base_name, discovered, paginator, depth+1)
                       return
-                  
-                  # Process all subfolders
-                  for sub_prefix, folder_name in all_prefixes:
-                      
-                      # Check for version folders (v1, v2) - these are table roots for Stellar-style data
-                      if folder_name in VERSION_FOLDER_PATTERN:
-                          # Verify this version folder has Hive partitions (date=...)
+                  for sub_prefix, folder in all_prefixes:
+                      if folder in VERSION_FOLDERS:
                           if has_hive_partitions(bucket, sub_prefix):
-                              # This version folder IS the table root - set crawler path here
-                              s3_path = f"s3://{bucket}/{sub_prefix}"
-                              if base_name not in discovered:
-                                  discovered[base_name] = s3_path
-                                  print(f"Found blockchain (version folder with partitions): {base_name} at {s3_path}")
-                          else:
-                              # Version folder without Hive partitions - recurse deeper
-                              scan_for_blockchains(bucket, sub_prefix, base_name, discovered, paginator, depth + 1)
-                          continue
-                      
-                      # Check for Hive-style partitions directly (date=YYYY-MM-DD)
-                      # If we see these, the PARENT folder is the table root
-                      if '=' in folder_name:
-                          # Parent is the table root, already handled by caller
-                          continue
-                      
-                      # Check if this folder contains blockchain tables
-                      if is_blockchain_folder(bucket, sub_prefix):
-                          # Determine the database name
-                          if folder_name in NETWORK_INDICATORS:
-                              # Network-specific: stellar_pubnet, stellar_testnet
-                              db_name = f"{base_name}_{folder_name}"
-                              # Recurse into network folder to find version folders
-                              print(f"  Found network folder: {folder_name}, scanning for version folders...")
-                              scan_for_blockchains(bucket, sub_prefix, db_name, discovered, paginator, depth + 1)
-                          elif folder_name in BLOCKCHAIN_TABLE_INDICATORS:
-                              # This is a table folder (blocks, transactions, etc.)
-                              # The PARENT folder is the blockchain root - set crawler there
-                              s3_path = f"s3://{bucket}/{prefix}"
-                              if base_name not in discovered:
-                                  discovered[base_name] = s3_path
-                                  print(f"Found blockchain (from table indicator): {base_name} at {s3_path}")
-                              # Don't continue processing siblings - we've found the blockchain root
+                              if base_name not in discovered: discovered[base_name] = f"s3://{bucket}/{sub_prefix}"
+                          else: scan_for_blockchains(bucket, sub_prefix, base_name, discovered, paginator, depth+1)
+                      elif '=' in folder: continue
+                      elif is_blockchain_folder(bucket, sub_prefix):
+                          if folder in NETWORK_INDICATORS:
+                              scan_for_blockchains(bucket, sub_prefix, f"{base_name}_{folder}", discovered, paginator, depth+1)
+                          elif folder in TABLE_INDICATORS:
+                              if base_name not in discovered: discovered[base_name] = f"s3://{bucket}/{prefix}"
                               return
                           else:
-                              # This is a sub-chain under a vendor namespace (e.g., sonarx/aptos)
-                              # Create separate database for each sub-chain
-                              sub_chain_name = f"{base_name}_{folder_name}"
-                              s3_path = f"s3://{bucket}/{sub_prefix}"
-                              if sub_chain_name not in discovered:
-                                  discovered[sub_chain_name] = s3_path
-                                  print(f"Found blockchain (vendor sub-chain): {sub_chain_name} at {s3_path}")
-                          continue
-                      
-                      # If it's an intermediate folder, recurse into it
-                      if folder_name in INTERMEDIATE_FOLDERS:
-                          print(f"  Scanning intermediate folder: {folder_name}")
-                          scan_for_blockchains(bucket, sub_prefix, base_name, discovered, paginator, depth + 1)
-                          continue
-                      
-                      # If it's a network indicator folder, recurse with network-aware naming
-                      if folder_name in NETWORK_INDICATORS:
-                          print(f"  Found network folder: {folder_name}")
-                          network_name = f"{base_name}_{folder_name}"
-                          scan_for_blockchains(bucket, sub_prefix, network_name, discovered, paginator, depth + 1)
-                          
-              except Exception as e:
-                  print(f"Error scanning {prefix}: {e}")
+                              name = f"{base_name}_{folder}"
+                              if name not in discovered: discovered[name] = f"s3://{bucket}/{sub_prefix}"
+                      elif folder in {'data','raw','processed'} or folder in NETWORK_INDICATORS:
+                          scan_for_blockchains(bucket, sub_prefix, f"{base_name}_{folder}" if folder in NETWORK_INDICATORS else base_name, discovered, paginator, depth+1)
+              except Exception as e: print(f"Error scanning {prefix}: {e}")
           
           def discover_blockchains(bucket, version):
-              """
-              Discover blockchain namespaces, automatically detecting vendor directories
-              and nested structures like stellar/parquet/pubnet/.
-              Returns dict of blockchain_name -> s3_path
-              """
-              discovered = {}
-              paginator = s3.get_paginator('list_objects_v2')
-              
+              discovered, paginator = {}, s3.get_paginator('list_objects_v2')
               try:
-                  pages = paginator.paginate(
-                      Bucket=bucket,
-                      Prefix=f"{version}/",
-                      Delimiter='/',
-                      RequestPayer='requester'
-                  )
-                  for page in pages:
-                      for prefix_obj in page.get('CommonPrefixes', []):
-                          prefix = prefix_obj['Prefix']
-                          parts = prefix.strip('/').split('/')
-                          if len(parts) < 2:
-                              continue
-                          
+                  for page in paginator.paginate(Bucket=bucket, Prefix=f"{version}/", Delimiter='/', RequestPayer='requester'):
+                      for p in page.get('CommonPrefixes', []):
+                          prefix, parts = p['Prefix'], p['Prefix'].strip('/').split('/')
+                          if len(parts) < 2: continue
                           name = parts[1].lower()
-                          
-                          # Check if this is a blockchain folder directly
-                          if is_blockchain_folder(bucket, prefix):
-                              s3_path = f"s3://{bucket}/{prefix}"
-                              discovered[name] = s3_path
-                              print(f"Found blockchain: {name} at {s3_path}")
-                          else:
-                              # Scan deeper for nested structures
-                              print(f"Scanning {name} for nested blockchain data...")
-                              scan_for_blockchains(bucket, prefix, name, discovered, paginator, depth=0)
-                              
-              except Exception as e:
-                  print(f"Error scanning {version}: {e}")
-              
+                          if is_blockchain_folder(bucket, prefix): discovered[name] = f"s3://{bucket}/{prefix}"
+                          else: scan_for_blockchains(bucket, prefix, name, discovered, paginator, depth=0)
+              except Exception as e: print(f"Error scanning {version}: {e}")
               return discovered
           
           def handler(event, context):
-              print(f"Event: {json.dumps(event)}")
-              
-              bucket = os.environ['S3_BUCKET']
-              schema_version = os.environ['SCHEMA_VERSION']
-              schema_version_ton = os.environ.get('SCHEMA_VERSION_TON', 'v1.1')
-              crawler_role = os.environ['CRAWLER_ROLE_ARN']
-              stack_name = os.environ['STACK_NAME']
-              sns_topic = os.environ['SNS_TOPIC_ARN']
+              bucket, stack_name = os.environ['S3_BUCKET'], os.environ['STACK_NAME']
+              crawler_role, sns_topic = os.environ['CRAWLER_ROLE_ARN'], os.environ['SNS_TOPIC_ARN']
               default_schedule = os.environ.get('DEFAULT_CRAWLER_SCHEDULE', 'daily')
               
-              # Discover blockchain namespaces in S3 (auto-detects vendor namespaces)
-              all_blockchains = {}  # blockchain_name -> s3_path
-              for version in [schema_version, schema_version_ton]:
-                  discovered = discover_blockchains(bucket, version)
-                  # Only add if not already discovered (prefer earlier schema version)
-                  for name, path in discovered.items():
-                      if name not in all_blockchains:
-                          all_blockchains[name] = path
+              manifest_data = discover_from_manifest(bucket)
+              if manifest_data:
+                  all_blockchains = {n: i['path'] for n, i in manifest_data.items()}
+                  blockchain_descriptions = {n: i['description'] for n, i in manifest_data.items()}
+                  discovery_method = 'manifest'
+              else:
+                  all_blockchains, blockchain_descriptions = {}, {}
+                  for ver in [os.environ['SCHEMA_VERSION'], os.environ.get('SCHEMA_VERSION_TON', 'v1.1')]:
+                      for name, path in discover_blockchains(bucket, ver).items():
+                          if name not in all_blockchains: all_blockchains[name] = path
+                  discovery_method = 'heuristic'
               
-              print(f"Discovered blockchains: {list(all_blockchains.keys())}")
-              
-              created_databases = []
-              created_crawlers = []
-              created_schedules = []
-              started_crawlers = []
+              print(f"Discovered ({discovery_method}): {list(all_blockchains.keys())}")
+              created_dbs, created_crawlers, created_schedules, started = [], [], [], []
               
               for blockchain, s3_path in all_blockchains.items():
-                  db_name = blockchain.lower()
-                  crawler_name = f"{stack_name}-{blockchain.upper()}-Crawler"
+                  db_name, crawler_name = blockchain.lower(), f"{stack_name}-{blockchain.upper()}-Crawler"
+                  db_desc = f'[{stack_name}] {blockchain_descriptions.get(blockchain, f"Auto-discovered {blockchain.upper()} blockchain data")}'
                   
-                  # Create database if it doesn't exist
-                  try:
-                      glue.get_database(Name=db_name)
-                      print(f"Database {db_name} already exists")
+                  try: glue.get_database(Name=db_name)
                   except glue.exceptions.EntityNotFoundException:
-                      print(f"Creating database: {db_name}")
-                      glue.create_database(
-                          DatabaseInput={
-                              'Name': db_name,
-                              'Description': f'[{stack_name}] Auto-discovered {blockchain.upper()} blockchain data'
-                          }
-                      )
-                      created_databases.append(db_name)
+                      glue.create_database(DatabaseInput={'Name': db_name, 'Description': db_desc})
+                      created_dbs.append(db_name)
                   
-                  # s3_path is already determined from discovery
-                  print(f"Using S3 path for {blockchain}: {s3_path}")
-                  
-                  # Create crawler if it doesn't exist (with built-in schedule)
-                  crawler_created = False
-                  schedule_expr = SCHEDULE_MAP.get(default_schedule)
-                  try:
-                      glue.get_crawler(Name=crawler_name)
-                      print(f"Crawler {crawler_name} already exists")
+                  schedule_expr, crawler_created = SCHEDULE_MAP.get(default_schedule), False
+                  try: glue.get_crawler(Name=crawler_name)
                   except glue.exceptions.EntityNotFoundException:
-                      print(f"Creating crawler: {crawler_name} for {s3_path}")
-                      # Calculate table level from S3 path depth
-                      # s3://bucket/a/b/c/ = 3 levels after bucket
-                      path_parts = s3_path.replace('s3://', '').split('/')
-                      # Filter empty parts and count (bucket + path segments)
-                      table_level = len([p for p in path_parts if p])
-                      
-                      # Determine if this is a deep path (like Stellar's parquet/pubnet/v1/)
-                      # Deep paths need TableGroupingPolicy to combine partitions into one table
-                      # Standard paths (btc/, eth/) should let Glue create separate tables naturally
-                      is_deep_path = table_level > 4  # More than bucket/version/chain/table
-                      
-                      crawler_config = {
-                          "Version": 1.0,
-                          "CrawlerOutput": {
-                              "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"},
-                              "Tables": {"AddOrUpdateBehavior": "MergeNewColumns"}
-                          }
-                      }
-                      
-                      # Only add grouping policy for deep paths (Stellar-style)
-                      if is_deep_path:
-                          crawler_config["Grouping"] = {
-                              "TableGroupingPolicy": "CombineCompatibleSchemas",
-                              "TableLevelConfiguration": table_level
-                          }
-                      
-                      crawler_params = {
-                          'Name': crawler_name,
-                          'Role': crawler_role,
-                          'DatabaseName': db_name,
-                          'Description': f'Auto-created crawler for {blockchain.upper()} blockchain',
-                          'Targets': {
-                              'S3Targets': [{
-                                  'Path': s3_path,
-                                  'SampleSize': 10,
-                                  'Exclusions': [
-                                      '**/*.xdr',
-                                      '**/*.xdr.zstd',
-                                      '**/*.json',
-                                      '**/*.csv',
-                                      '**/*.txt',
-                                      '**/_SUCCESS',
-                                      '**/_metadata',
-                                      '**/_common_metadata'
-                                  ]
-                              }]
-                          },
-                          'SchemaChangePolicy': {
-                              'UpdateBehavior': 'LOG',
-                              'DeleteBehavior': 'LOG'
-                          },
-                          'RecrawlPolicy': {
-                              'RecrawlBehavior': 'CRAWL_NEW_FOLDERS_ONLY'
-                          },
-                          'Configuration': json.dumps(crawler_config)
-                      }
-                      # Add schedule if not disabled
-                      if schedule_expr:
-                          crawler_params['Schedule'] = schedule_expr
-                          created_schedules.append(f"{crawler_name} ({default_schedule})")
-                      
-                      glue.create_crawler(**crawler_params)
-                      created_crawlers.append(crawler_name)
-                      crawler_created = True
+                      path_parts = [p for p in s3_path.replace('s3://', '').split('/') if p]
+                      table_level = len(path_parts)
+                      cfg = {"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"},"Tables":{"AddOrUpdateBehavior":"MergeNewColumns"}}}
+                      if table_level > 4: cfg["Grouping"] = {"TableGroupingPolicy":"CombineCompatibleSchemas","TableLevelConfiguration":table_level}
+                      params = {'Name':crawler_name,'Role':crawler_role,'DatabaseName':db_name,'Description':f'Crawler for {blockchain}',
+                          'Targets':{'S3Targets':[{'Path':s3_path,'SampleSize':10,'Exclusions':['**/*.xdr','**/*.xdr.zstd','**/*.json','**/*.csv','**/*.txt','**/_SUCCESS','**/_metadata','**/_common_metadata']}]},
+                          'SchemaChangePolicy':{'UpdateBehavior':'LOG','DeleteBehavior':'LOG'},'RecrawlPolicy':{'RecrawlBehavior':'CRAWL_NEW_FOLDERS_ONLY'},'Configuration':json.dumps(cfg)}
+                      if schedule_expr: params['Schedule'] = schedule_expr; created_schedules.append(crawler_name)
+                      glue.create_crawler(**params); created_crawlers.append(crawler_name); crawler_created = True
                   
-                  # Start the crawler on first creation
                   if crawler_created:
                       try:
-                          crawler_state = glue.get_crawler(Name=crawler_name)['Crawler']['State']
-                          if crawler_state == 'READY':
-                              print(f"Starting crawler: {crawler_name}")
-                              glue.start_crawler(Name=crawler_name)
-                              started_crawlers.append(crawler_name)
-                          else:
-                              print(f"Crawler {crawler_name} is {crawler_state}, skipping start")
-                      except Exception as e:
-                          print(f"Error starting crawler {crawler_name}: {e}")
+                          if glue.get_crawler(Name=crawler_name)['Crawler']['State'] == 'READY':
+                              glue.start_crawler(Name=crawler_name); started.append(crawler_name)
+                      except: pass
               
-              # Send notification
-              if created_databases or created_crawlers or created_schedules:
-                  message = f"""
-          Blockchain Discovery Report
-          ============================
-          
-          Blockchains Found: {len(all_blockchains)}
-          {chr(10).join(f'  - {b}' for b in sorted(all_blockchains.keys()))}
-          
-          New Databases Created: {len(created_databases)}
-          {chr(10).join(f'  - {db}' for db in created_databases) if created_databases else '  None'}
-          
-          New Crawlers Created: {len(created_crawlers)}
-          {chr(10).join(f'  - {c}' for c in created_crawlers) if created_crawlers else '  None'}
-          
-          New Schedules Created: {len(created_schedules)}
-          {chr(10).join(f'  - {s}' for s in created_schedules) if created_schedules else '  None'}
-          
-          Crawlers Started: {len(started_crawlers)}
-          {chr(10).join(f'  - {c}' for c in started_crawlers) if started_crawlers else '  None'}
-          
-          Tables will be available in Athena once crawlers complete.
-          
-          To change a crawler's schedule, use the AWS Console or CLI:
-            aws glue update-crawler --name <crawler-name> --schedule "cron(0 * * * ? *)"
-          """
-                  
-                  sns.publish(
-                      TopicArn=sns_topic,
-                      Subject=f"Blockchain Discovery: {len(all_blockchains)} chains found",
-                      Message=message
-                  )
+              if created_dbs or created_crawlers:
+                  msg = f"Discovery: {discovery_method}\nChains: {len(all_blockchains)}\nNew DBs: {created_dbs}\nNew Crawlers: {created_crawlers}\nStarted: {started}"
+                  sns.publish(TopicArn=sns_topic, Subject=f"Blockchain Discovery: {len(all_blockchains)} chains", Message=msg)
               
-              return {
-                  'statusCode': 200,
-                  'body': json.dumps({
-                      'discovered': list(all_blockchains.keys()),
-                      'created_databases': created_databases,
-                      'created_crawlers': created_crawlers,
-                      'created_schedules': created_schedules,
-                      'started_crawlers': started_crawlers
-                  })
-              }
+              return {'statusCode':200,'body':json.dumps({'discovery_method':discovery_method,'discovered':list(all_blockchains.keys()),'created_databases':created_dbs,'created_crawlers':created_crawlers,'started_crawlers':started})}
 
   BlockchainDiscoveryRole:
     Type: AWS::IAM::Role

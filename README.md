@@ -215,14 +215,17 @@ Use the `AWSPublicBlockchain` workgroup in Athena for queries.
 ┌─────────────────────────────────────────────────────────────┐
 │              AWS Public Blockchain S3 Bucket                 │
 │                  (aws-public-blockchain)                     │
+│                                                              │
+│  manifest.json ← Primary discovery source                    │
+│  v1.0/btc/, v1.0/eth/, v1.1/ton/, ...                       │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │           BlockchainDiscoveryFunction (Lambda)               │
-│  • Scans S3 for blockchain namespaces (v1.0/, v1.1/)        │
-│  • Creates Glue database per blockchain                      │
-│  • Creates Glue crawler per blockchain with schedule         │
-│  • Handles nested structures (e.g., stellar/parquet/pubnet) │
+│  1. Fetch manifest.json (single S3 GET)                     │
+│  2. If manifest exists: use chain paths and descriptions    │
+│  3. If manifest missing: fall back to recursive S3 scan     │
+│  4. Create Glue database + crawler per blockchain           │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -241,6 +244,14 @@ Use the `AWSPublicBlockchain` workgroup in Athena for queries.
 │              (AWSPublicBlockchain workgroup)                 │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Discovery Methods
+
+The `BlockchainDiscoveryFunction` uses a two-tier discovery approach:
+
+1. **Manifest-based (preferred)**: Fetches `manifest.json` from the bucket root. This file contains chain names, S3 paths, and descriptions. Single S3 GET operation, no recursion needed.
+
+2. **Heuristic fallback**: If manifest is missing or corrupted, falls back to recursive S3 scanning that detects blockchain folders by looking for table indicators (blocks, transactions, etc.) and handles nested structures like `stellar/parquet/pubnet/`.
 
 ---
 

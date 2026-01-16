@@ -22,15 +22,17 @@ This document describes the architecture of the automated blockchain schema disc
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                  AWS Public Blockchain S3                    │
+│  manifest.json ← Chain registry with paths & descriptions   │
 │  v1.0/btc/  v1.0/eth/  v1.1/ton/  v1.0/newchain/           │
 └─────────────────────────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────────┐
 │              BlockchainDiscoveryFunction (Lambda)            │
-│  1. Scans S3 for blockchain namespaces                      │
-│  2. Creates Glue database per blockchain                    │
-│  3. Creates Glue crawler with built-in schedule             │
-│  4. Starts crawlers on first creation                       │
+│  1. Fetch manifest.json (single S3 GET) - preferred         │
+│  2. Fall back to S3 scan if manifest unavailable            │
+│  3. Creates Glue database per blockchain                    │
+│  4. Creates Glue crawler with built-in schedule             │
+│  5. Starts crawlers on first creation                       │
 └─────────────────────────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -65,13 +67,21 @@ This document describes the architecture of the automated blockchain schema disc
 - Manual invocation
 - CloudFormation custom resource (on stack creation)
 
+**Discovery Methods**:
+
+1. **Manifest-based (preferred)**: Fetches `manifest.json` from the bucket root. This file contains chain names, S3 paths, and descriptions. Single S3 GET operation, no recursion needed.
+
+2. **Heuristic fallback**: If manifest is missing or corrupted, falls back to recursive S3 scanning that detects blockchain folders by looking for table indicators (blocks, transactions, etc.) and handles nested structures.
+
 **Process**:
-1. Scan S3 bucket for blockchain namespaces (v1.0/*, v1.1/*)
-2. For each discovered blockchain:
-   - Create Glue database if not exists
+1. Attempt to fetch and parse `manifest.json`
+2. If manifest available: extract chain paths and descriptions
+3. If manifest unavailable: scan S3 bucket for blockchain namespaces (v1.0/*, v1.1/*)
+4. For each discovered blockchain:
+   - Create Glue database if not exists (with description from manifest if available)
    - Create Glue crawler with built-in schedule if not exists
    - Start crawler on first creation
-3. Send SNS notification with discovery report
+5. Send SNS notification with discovery report
 
 **Environment Variables**:
 - `S3_BUCKET`: Source bucket
@@ -80,28 +90,29 @@ This document describes the architecture of the automated blockchain schema disc
 - `CRAWLER_ROLE_ARN`: IAM role for crawlers
 - `STACK_NAME`: CloudFormation stack name
 - `SNS_TOPIC_ARN`: Notification topic
-- `DEFAULT_CRAWLER_SCHEDULE`: Default schedule (1min/10min/hourly/daily/disabled)
+- `DEFAULT_CRAWLER_SCHEDULE`: Default schedule (hourly/daily/weekly/disabled)
 
 **Schedule Mapping**:
 ```python
 SCHEDULE_MAP = {
-    'hourly': 'cron(0 * * * ? *)',
-    'daily': 'cron(0 0 * * ? *)',
-    'weekly': 'cron(0 0 ? * SUN *)',
-    'disabled': None
+    'hourly': 'cron(0 * * * ? *)',    # Every hour at minute 0
+    'daily': 'cron(0 0 * * ? *)',      # Daily at midnight UTC
+    'weekly': 'cron(0 0 ? * SUN *)',   # Weekly on Sunday at midnight UTC
+    'disabled': None                    # No automatic scheduling
 }
 ```
 
 ### 2. CrawlerCompletionHandler
 
-**Purpose**: Send notifications when crawlers complete
+**Purpose**: Post-process crawler results and send notifications
 
 **Trigger**: EventBridge rule on Glue Crawler State Change events
 
 **Process**:
 1. Receive crawler completion event
 2. Query Glue for crawler and table details
-3. Send SNS notification with discovered tables
+3. De-duplicate table schemas (remove columns that collide with partition keys)
+4. Send SNS notification with discovered tables and any schema updates
 
 ### 3. Glue Crawlers
 
@@ -125,13 +136,15 @@ SCHEDULE_MAP = {
 ### New Blockchain Discovery
 
 ```
-1. New blockchain added to S3: s3://aws-public-blockchain/v1.0/sol/
+1. New blockchain added to S3 and manifest.json updated
 
 2. Discovery Lambda runs (weekly or manual)
-   - Scans S3, finds "sol" namespace
+   - Fetches manifest.json (single S3 GET)
+   - Finds new "sol" chain with path and description
+   - (Falls back to S3 scan if manifest unavailable)
    
 3. Creates resources:
-   - Database: sol
+   - Database: sol (with description from manifest)
    - Crawler: {stack}-SOL-Crawler (with daily schedule)
    
 4. Starts crawler immediately
@@ -245,18 +258,21 @@ All crawlers are scoped to `{stack-name}-*` pattern.
 
 ### Adding Custom Schedules
 
-Modify `SCHEDULE_MAP` in BlockchainDiscoveryFunction:
+To add custom schedules, modify `SCHEDULE_MAP` in BlockchainDiscoveryFunction and add corresponding `AllowedValues` to the CloudFormation parameter:
+
 ```python
+# Example: Adding 5-minute and monthly schedules
 SCHEDULE_MAP = {
-    '1min': 'cron(0/1 * * * ? *)',
-    '5min': 'cron(0/5 * * * ? *)',  # Add new option
-    '10min': 'cron(0/10 * * * ? *)',
-    'hourly': 'cron(0 * * * ? *)',
-    'daily': 'cron(0 0 * * ? *)',
-    'weekly': 'cron(0 0 ? * SUN *)',  # Add new option
+    '5min': 'cron(0/5 * * * ? *)',     # Every 5 minutes
+    'hourly': 'cron(0 * * * ? *)',      # Every hour
+    'daily': 'cron(0 0 * * ? *)',       # Daily at midnight UTC
+    'weekly': 'cron(0 0 ? * SUN *)',    # Weekly on Sunday
+    'monthly': 'cron(0 0 1 * ? *)',     # Monthly on the 1st
     'disabled': None
 }
 ```
+
+Note: Also update the `DefaultCrawlerSchedule` parameter's `AllowedValues` in the CloudFormation template.
 
 ### Custom Processing
 
@@ -366,10 +382,11 @@ Full crawler configuration:
 
 1. **Minimum schedule**: 1 minute (Glue cron limit)
 2. **Parquet only**: Assumes data is in Parquet format (non-Parquet files are excluded)
-3. **S3 structure**: Assumes `{version}/{blockchain}/` structure
-4. **Concurrent crawlers**: AWS Glue has soft limits on concurrent crawlers
-5. **Schema changes**: With CRAWL_NEW_FOLDERS_ONLY, schema changes are logged but not applied
-6. **Table limit**: Glue has a 200,000 table limit per database
+3. **Manifest dependency**: Optimal discovery requires `manifest.json` in bucket root; falls back to heuristic S3 scanning if unavailable
+4. **S3 structure (fallback)**: Heuristic discovery assumes `{version}/{blockchain}/` structure
+5. **Concurrent crawlers**: AWS Glue has soft limits on concurrent crawlers
+6. **Schema changes**: With CRAWL_NEW_FOLDERS_ONLY, schema changes are logged but not applied
+7. **Table limit**: Glue has a 200,000 table limit per database
 
 ---
 

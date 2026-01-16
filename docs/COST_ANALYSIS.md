@@ -1,6 +1,6 @@
 # Cost Analysis: Blockchain Crawler Architecture
 
-This document provides a comprehensive cost breakdown for the AWS Public Blockchain crawler architecture, along with optimization strategies for different use cases.
+This document provides an *estimated* cost breakdown for the AWS Public Blockchain crawler architecture, along with optimization strategies for different use cases.
 
 ---
 
@@ -13,6 +13,8 @@ The crawler architecture consists of:
 - **SNS**: Notifications
 - **EventBridge**: Scheduling and event routing
 - **Athena**: Query execution
+
+> **Regional Pricing Note**: All costs in this document are based on US East (N. Virginia) pricing as of January 2026. AWS pricing varies by region — always verify current pricing at [aws.amazon.com/pricing](https://aws.amazon.com/pricing/) for your deployment region.
 
 ---
 
@@ -112,7 +114,7 @@ With `TableLevelSampleSize: 10`, crawl times are dramatically reduced. Costs bel
 
 *Lower end assumes incremental crawls (`CRAWL_NEW_FOLDERS_ONLY`), higher end for initial/full crawls.
 
-> **Glue Pricing**: ~$0.44/DPU-hour. With sampling enabled, even large chains like Stellar complete in minutes instead of hours.
+> **Glue Pricing**: ~$0.44/DPU-hour (US regions). Crawlers have a 10-minute minimum billing duration. Prices vary by region — check [AWS Glue Pricing](https://aws.amazon.com/glue/pricing/) for your region. With sampling enabled, even large chains like Stellar complete in minutes instead of hours.
 
 #### Athena Query Costs
 
@@ -122,7 +124,7 @@ With `TableLevelSampleSize: 10`, crawl times are dramatically reduced. Costs bel
 | Moderate | 50 | ~100GB | $5.00 |
 | Heavy | 200+ | ~500GB | $25.00 |
 
-> **Athena Pricing**: $5 per TB scanned
+> **Athena Pricing**: $5 per TB scanned (US regions). Prices vary by region — check [AWS Athena Pricing](https://aws.amazon.com/athena/pricing/) for your region.
 
 ### Total Monthly Estimates (Default)
 
@@ -132,7 +134,7 @@ With `TableLevelSampleSize: 10`, crawl times are dramatically reduced. Costs bel
 | Typical | 5 | Moderate | **$6-10** |
 | Production | 10 | Heavy | **$30-40** |
 
-> Note: Costs reduced from previous estimates due to `TableLevelSampleSize` optimization.
+> Note: Costs reduced from previous estimates due to `SampleSize: 10` optimization on S3Targets.
 
 ---
 
@@ -247,6 +249,27 @@ WHERE date = '2024-01-15';
 
 **Savings**: 50-90% reduction in Athena costs with proper filtering
 
+> **⚠️ Warning: Deep Historical Scans**
+> 
+> Queries that require scanning large historical ranges can quickly become expensive. For example, calculating token transfer history or aggregating data across years of blockchain activity:
+> 
+> ```sql
+> -- EXPENSIVE: Finding all ERC-20 transfers for a token across full history
+> -- Scans the token_transfers table from 2015 to present
+> SELECT date, from_address, to_address, value
+> FROM aws_ethereum_mainnet.token_transfers
+> WHERE token_address = '0xdac17f958d2ee523a2206206994597c13d831ec7'  -- USDT
+>   AND date <= '2024-01-15';
+> -- Could scan 100s of GB depending on token activity
+> -- Estimated cost: $2-10+ per query depending on columns selected
+> ```
+> 
+> For balance calculations and similar aggregations over full history, consider:
+> - Using a dedicated indexing service (e.g., The Graph, Dune Analytics)
+> - Pre-computing balances with scheduled ETL jobs and storing snapshots
+> - Limiting queries to recent date ranges when full history isn't required
+> - Selecting only the columns you need (Parquet is columnar, so fewer columns = less data scanned)
+
 ### Strategy 5: Selective Chain Monitoring
 
 Not all chains need the same monitoring frequency. Tier your chains:
@@ -295,7 +318,7 @@ aws glue update-crawler --name blockchain-crawlers-DOGE-Crawler \
 - 15 chains, daily crawls, heavy queries
 - **Monthly cost: $40-60**
 
-> All scenarios assume `TableLevelSampleSize: 10`. Without sampling, costs for large chains like Stellar would be 10-50x higher.
+> All scenarios assume `SampleSize: 10` on S3Targets. Without sampling, costs for large chains like Stellar would be 10-50x higher.
 
 ---
 
@@ -371,7 +394,7 @@ aws athena list-query-executions --work-group AWSPublicBlockchain
 
 ## Summary
 
-The default architecture costs **$6-10/month** for typical usage with 5 chains and daily crawls. The `TableLevelSampleSize: 10` setting ensures even large chains like Stellar (60M+ files) crawl in minutes instead of hours.
+The default architecture costs **$6-10/month** for typical usage with 5 chains and daily crawls. The `SampleSize: 10` setting on S3Targets ensures even large chains like Stellar (60M+ files) crawl in minutes instead of hours.
 
 For cost-sensitive deployments:
 

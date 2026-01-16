@@ -449,9 +449,6 @@ aws glue list-crawlers --query 'CrawlerNames[?starts_with(@, `blockchain-crawler
 ├── docs/
 │   ├── COST_ANALYSIS.md                          # Detailed cost breakdown
 │   └── CRAWLER_DESIGN.md                         # Architecture documentation
-├── utils/
-│   ├── blockchain_schema_discovery.py            # Python utility for manual S3 exploration
-│   └── requirements-discovery.txt                # Python dependencies
 └── README.md                                      # This file
 ```
 

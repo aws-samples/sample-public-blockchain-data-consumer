@@ -15,7 +15,9 @@ Automatically discover and catalog blockchain data from the [AWS Public Blockcha
 
 ## CloudFormation Quick Create
 
-[![Launch Stack](docs/static/quick-create-launch-stack.png)](https://us-east-2.console.aws.amazon.com/cloudformation/home?region=us-east-2#/stacks/quickcreate?templateURL=https%3A%2F%2Faws-public-blockchain.s3.us-east-2.amazonaws.com%2Faws-public-blockchain-with-crawlers.yaml&stackName=blockchain-crawlers&param_S3Bucket=aws-public-blockchain&param_SchemaVersion=v1.0&param_DiscoverySchedule=cron(0%202%20%3F%20*%20SUN%20*)&param_EnableAutoCrawling=true&param_SchemaVersionTON=v1.1&param_DefaultCrawlerSchedule=daily)
+<a href="https://us-east-2.console.aws.amazon.com/cloudformation/home?region=us-east-2#/stacks/quickcreate?templateURL=https%3A%2F%2Faws-public-blockchain.s3.us-east-2.amazonaws.com%2Faws-public-blockchain-with-crawlers.yaml&stackName=blockchain-crawlers&param_S3Bucket=aws-public-blockchain&param_SchemaVersion=v1.0&param_DiscoverySchedule=cron(0%202%20%3F%20*%20SUN%20*)&param_EnableAutoCrawling=true&param_SchemaVersionTON=v1.1&param_DefaultCrawlerSchedule=daily">
+  <img src="docs/static/quick-create-launch-stack.png" alt="Launch Stack" width="180">
+</a>
 
 Click the button above to deploy with default settings. You'll need to:
 1. Acknowledge IAM resource creation

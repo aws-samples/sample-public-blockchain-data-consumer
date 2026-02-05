@@ -1,68 +1,49 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  AWS Public Blockchain Data Consumer Architecture with Automated Schema Discovery.
-  This template extends the base architecture with Glue Crawlers that automatically
-  discover and catalog new blockchain data schemas.
+  AWS Public Blockchain Data Consumer with Hybrid Schema Discovery.
+  Uses Glue Crawlers for initial schema discovery, then partition projection
+  for automatic partition resolution. Crawlers run once and are disabled by default.
 
 Parameters:
   S3Bucket:
-    Description: The S3 bucket with the AWS Public Blockchain Data
     Type: String
     Default: "aws-public-blockchain"
-  
+    Description: Source S3 bucket with blockchain data
   SchemaVersion:
     Type: String
     Default: "v1.0"
-    Description: Default schema version for BTC/ETH
-  
+    Description: Schema version for BTC/ETH
   SchemaVersionTON:
     Type: String
     Default: "v1.1"
-    Description: Schema version for TON blockchain
-  
+    Description: Schema version for TON and newer chains
   DiscoverySchedule:
     Type: String
     Default: "cron(0 2 ? * SUN *)"
-    Description: Schedule for blockchain discovery (default weekly on Sunday at 2 AM UTC)
-  
+    Description: Schedule for new blockchain discovery (weekly)
   DefaultCrawlerSchedule:
     Type: String
-    Default: "daily"
-    AllowedValues:
-      - "hourly"
-      - "daily"
-      - "weekly"
-      - "disabled"
-    Description: Default schedule for per-blockchain crawlers (can be changed per-chain via CLI)
-  
+    Default: "disabled"
+    AllowedValues: ["hourly", "daily", "weekly", "disabled"]
+    Description: Default crawler schedule. Disabled since partition projection handles new partitions.
   EnableAutoCrawling:
     Type: String
     Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: Enable automatic crawler scheduling
+    AllowedValues: ["true", "false"]
+    Description: Enable automatic discovery scheduling
+  LambdaBucket:
+    Type: String
+    Default: ""
+    Description: S3 bucket containing Lambda code (leave empty for inline code)
 
-Metadata:
-  AWS::CloudFormation::Interface:
-    ParameterGroups:
-      - Label:
-          default: "Data Source Configuration"
-        Parameters:
-          - S3Bucket
-          - SchemaVersion
-          - SchemaVersionTON
-      - Label:
-          default: "Crawler Configuration"
-        Parameters:
-          - DiscoverySchedule
-          - DefaultCrawlerSchedule
-          - EnableAutoCrawling
+Conditions:
+  EnableCrawling: !Equals [!Ref EnableAutoCrawling, "true"]
+  UseS3Lambda: !Not [!Equals [!Ref LambdaBucket, ""]]
 
 Resources:
-  # ============================================================================
+  # ==========================================================================
   # S3 and Athena Resources
-  # ============================================================================
+  # ==========================================================================
   
   AthenaResultsBucket:
     Type: AWS::S3::Bucket
@@ -70,7 +51,6 @@ Resources:
     Properties:
       VersioningConfiguration:
         Status: Enabled
-      AccessControl: Private
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -84,6 +64,7 @@ Resources:
   AthenaResultsBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
+      Bucket: !Ref AthenaResultsBucket
       PolicyDocument:
         Version: 2012-10-17
         Statement:
@@ -97,7 +78,6 @@ Resources:
             Condition:
               Bool:
                 "aws:SecureTransport": false
-      Bucket: !Ref AthenaResultsBucket
 
   AthenaWorkgroup:
     Type: AWS::Athena::WorkGroup
@@ -114,9 +94,9 @@ Resources:
           EncryptionConfiguration:
             EncryptionOption: SSE_S3
 
-  # ============================================================================
-  # IAM Roles for Glue Crawlers
-  # ============================================================================
+  # ==========================================================================
+  # IAM Roles
+  # ==========================================================================
   
   GlueCrawlerRole:
     Type: AWS::IAM::Role
@@ -132,47 +112,135 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
       Policies:
-        - PolicyName: S3AccessPolicy
+        - PolicyName: S3Access
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:ListBucket
+                Action: [s3:GetObject, s3:ListBucket]
                 Resource:
                   - !Sub arn:aws:s3:::${S3Bucket}
                   - !Sub arn:aws:s3:::${S3Bucket}/*
               - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:GetObject
-                Resource:
-                  - !Sub ${AthenaResultsBucket.Arn}/*
-        - PolicyName: GlueCatalogPolicy
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub ${AthenaResultsBucket.Arn}/*
+        - PolicyName: GlueCatalog
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action:
-                  - glue:*Database*
-                  - glue:*Table*
-                  - glue:*Partition*
+                Action: [glue:*Database*, glue:*Table*, glue:*Partition*]
                 Resource:
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*/*
 
-  # ============================================================================
-  # Dynamic Database Discovery - Creates Separate DB Per Blockchain
-  # ============================================================================
+  BlockchainDiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DiscoveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetObject]
+                Resource:
+                  - !Sub arn:aws:s3:::${S3Bucket}
+                  - !Sub arn:aws:s3:::${S3Bucket}/*
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:CreateDatabase, glue:GetCrawler, glue:CreateCrawler, glue:StartCrawler]
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt GlueCrawlerRole.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref CrawlerNotificationTopic
+
+  InitialDiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeDiscovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt BlockchainDiscoveryFunction.Arn
+        - PolicyName: GlueCleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [glue:ListCrawlers, glue:GetCrawler, glue:StopCrawler, glue:DeleteCrawler, glue:GetDatabases, glue:GetTables, glue:DeleteTable, glue:DeleteDatabase]
+                Resource: '*'
+
+  CrawlerCompletionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [glue:GetCrawler, glue:GetDatabase, glue:GetTable, glue:GetTables, glue:UpdateTable]
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetObject]
+                Resource:
+                  - !Sub arn:aws:s3:::${S3Bucket}
+                  - !Sub arn:aws:s3:::${S3Bucket}/*
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref CrawlerNotificationTopic
+
+  # ==========================================================================
+  # Lambda Functions
+  # ==========================================================================
   
-  # Lambda function that discovers new blockchains and creates databases + crawlers
   BlockchainDiscoveryFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-BlockchainDiscovery
-      Description: Discovers new blockchains in S3 and creates dedicated databases and crawlers
+      Description: Discovers blockchains in S3 and creates Glue databases/crawlers
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt BlockchainDiscoveryRole.Arn
@@ -191,586 +259,251 @@ Resources:
         ZipFile: |
           import boto3, json, os
           glue, s3, sns = boto3.client('glue'), boto3.client('s3'), boto3.client('sns')
-          SCHEDULE_MAP = {'hourly': 'cron(0 * * * ? *)', 'daily': 'cron(0 0 * * ? *)', 'weekly': 'cron(0 0 ? * SUN *)', 'disabled': None}
-          MANIFEST_FILE = 'manifest.json'
+          SCHEDULE = {'hourly': 'cron(0 * * * ? *)', 'daily': 'cron(0 0 * * ? *)', 'weekly': 'cron(0 0 ? * SUN *)', 'disabled': None}
+          TABLES = {'blocks', 'transactions', 'logs', 'traces', 'token_transfers', 'contracts', 'messages'}
+          NETWORKS = {'pubnet', 'testnet', 'mainnet'}
+          VERSIONS = {'v1', 'v2', 'v3'}
           
-          def discover_from_manifest(bucket):
-              """Fetch manifest.json for chain discovery. Returns {name: {path, description}} or None."""
+          def has_parts(b, p):
               try:
-                  resp = s3.get_object(Bucket=bucket, Key=MANIFEST_FILE, RequestPayer='requester')
-                  manifest = json.loads(resp['Body'].read().decode('utf-8'))
-                  if 'chains' not in manifest: return None
-                  discovered = {}
-                  for chain in manifest['chains']:
-                      if 'name' not in chain or 'path' not in chain: continue
-                      name = chain['name'].lower()
-                      discovered[name] = {'path': f"s3://{bucket}/{chain['path']}", 'description': chain.get('description', f"Blockchain data for {name}")}
-                      print(f"Manifest: {name} at {discovered[name]['path']}")
-                  return discovered if discovered else None
-              except Exception as e:
-                  print(f"Manifest error: {e}")
-                  return None
-          
-          TABLE_INDICATORS = {'blocks','transactions','logs','traces','token_transfers','contracts','receipts','events','transfers','balances','accounts','messages','operations','ledgers','payments'}
-          NETWORK_INDICATORS = {'pubnet','testnet','mainnet','devnet'}
-          VERSION_FOLDERS = {'v1','v2','v3','v4','v5'}
-          
-          def has_hive_partitions(bucket, prefix):
-              try:
-                  resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter='/', MaxKeys=10, RequestPayer='requester')
-                  return any('=' in p['Prefix'].rstrip('/').split('/')[-1] for p in resp.get('CommonPrefixes', []))
+                  r = s3.list_objects_v2(Bucket=b, Prefix=p, Delimiter='/', MaxKeys=10, RequestPayer='requester')
+                  return any('=' in x['Prefix'].split('/')[-2] for x in r.get('CommonPrefixes', []))
               except: return False
           
-          def is_blockchain_folder(bucket, prefix):
+          def is_chain(b, p):
               try:
-                  resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter='/', MaxKeys=20, RequestPayer='requester')
-                  if any(o['Key'].endswith('.parquet') for o in resp.get('Contents', [])): return True
-                  subfolders = [p['Prefix'].rstrip('/').split('/')[-1].lower() for p in resp.get('CommonPrefixes', [])]
-                  if 'parquet' in subfolders: return False
-                  return any(f in TABLE_INDICATORS or f in VERSION_FOLDERS or f.startswith('date=') for f in subfolders)
+                  r = s3.list_objects_v2(Bucket=b, Prefix=p, Delimiter='/', MaxKeys=20, RequestPayer='requester')
+                  fs = [x['Prefix'].rstrip('/').split('/')[-1].lower() for x in r.get('CommonPrefixes', [])]
+                  if 'parquet' in fs: return False
+                  return any(f in TABLES or f in VERSIONS or f.startswith('date=') for f in fs)
               except: return False
           
-          def scan_for_blockchains(bucket, prefix, base_name, discovered, paginator, depth=0):
-              if depth > 5: return
+          def scan(b, p, n, found, pag, d=0):
+              if d > 5: return
               try:
-                  all_prefixes, parquet_prefix = [], None
-                  for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/', RequestPayer='requester'):
-                      for p in page.get('CommonPrefixes', []):
-                          folder = p['Prefix'].rstrip('/').split('/')[-1].lower()
-                          all_prefixes.append((p['Prefix'], folder))
-                          if folder == 'parquet': parquet_prefix = p['Prefix']
-                  if parquet_prefix:
-                      scan_for_blockchains(bucket, parquet_prefix, base_name, discovered, paginator, depth+1)
-                      return
-                  for sub_prefix, folder in all_prefixes:
-                      if folder in VERSION_FOLDERS:
-                          if has_hive_partitions(bucket, sub_prefix):
-                              if base_name not in discovered: discovered[base_name] = f"s3://{bucket}/{sub_prefix}"
-                          else: scan_for_blockchains(bucket, sub_prefix, base_name, discovered, paginator, depth+1)
-                      elif '=' in folder: continue
-                      elif is_blockchain_folder(bucket, sub_prefix):
-                          if folder in NETWORK_INDICATORS:
-                              scan_for_blockchains(bucket, sub_prefix, f"{base_name}_{folder}", discovered, paginator, depth+1)
-                          elif folder in TABLE_INDICATORS:
-                              if base_name not in discovered: discovered[base_name] = f"s3://{bucket}/{prefix}"
-                              return
+                  all_p = [(x['Prefix'], x['Prefix'].rstrip('/').split('/')[-1].lower()) for pg in pag.paginate(Bucket=b, Prefix=p, Delimiter='/', RequestPayer='requester') for x in pg.get('CommonPrefixes', [])]
+                  pq = next((x for x, f in all_p if f == 'parquet'), None)
+                  if pq: scan(b, pq, n, found, pag, d+1); return
+                  for sp, f in all_p:
+                      if f in VERSIONS:
+                          if has_parts(b, sp) and n not in found: found[n] = f"s3://{b}/{sp}"
+                          else: scan(b, sp, n, found, pag, d+1)
+                      elif '=' in f: continue
+                      elif is_chain(b, sp):
+                          if f in NETWORKS: scan(b, sp, f"{n}_{f}", found, pag, d+1)
+                          elif f in TABLES:
+                              if n not in found: found[n] = f"s3://{b}/{p}"; return
                           else:
-                              name = f"{base_name}_{folder}"
-                              if name not in discovered: discovered[name] = f"s3://{bucket}/{sub_prefix}"
-                      elif folder in {'data','raw','processed'} or folder in NETWORK_INDICATORS:
-                          scan_for_blockchains(bucket, sub_prefix, f"{base_name}_{folder}" if folder in NETWORK_INDICATORS else base_name, discovered, paginator, depth+1)
-              except Exception as e: print(f"Error scanning {prefix}: {e}")
+                              if f"{n}_{f}" not in found: found[f"{n}_{f}"] = f"s3://{b}/{sp}"
+                      elif f in NETWORKS: scan(b, sp, f"{n}_{f}", found, pag, d+1)
+              except: pass
           
-          def discover_blockchains(bucket, version):
-              discovered, paginator = {}, s3.get_paginator('list_objects_v2')
+          def discover(b, v):
+              found, pag = {}, s3.get_paginator('list_objects_v2')
               try:
-                  for page in paginator.paginate(Bucket=bucket, Prefix=f"{version}/", Delimiter='/', RequestPayer='requester'):
-                      for p in page.get('CommonPrefixes', []):
-                          prefix, parts = p['Prefix'], p['Prefix'].strip('/').split('/')
-                          if len(parts) < 2: continue
-                          name = parts[1].lower()
-                          if is_blockchain_folder(bucket, prefix): discovered[name] = f"s3://{bucket}/{prefix}"
-                          else: scan_for_blockchains(bucket, prefix, name, discovered, paginator, depth=0)
-              except Exception as e: print(f"Error scanning {version}: {e}")
-              return discovered
+                  for pg in pag.paginate(Bucket=b, Prefix=f"{v}/", Delimiter='/', RequestPayer='requester'):
+                      for x in pg.get('CommonPrefixes', []):
+                          p, n = x['Prefix'], x['Prefix'].strip('/').split('/')[1].lower()
+                          if is_chain(b, p): found[n] = f"s3://{b}/{p}"
+                          else: scan(b, p, n, found, pag)
+              except: pass
+              return found
           
           def handler(event, context):
-              bucket, stack_name = os.environ['S3_BUCKET'], os.environ['STACK_NAME']
-              crawler_role, sns_topic = os.environ['CRAWLER_ROLE_ARN'], os.environ['SNS_TOPIC_ARN']
-              default_schedule = os.environ.get('DEFAULT_CRAWLER_SCHEDULE', 'daily')
-              
-              manifest_data = discover_from_manifest(bucket)
-              if manifest_data:
-                  all_blockchains = {n: i['path'] for n, i in manifest_data.items()}
-                  blockchain_descriptions = {n: i['description'] for n, i in manifest_data.items()}
-                  discovery_method = 'manifest'
-              else:
-                  all_blockchains, blockchain_descriptions = {}, {}
-                  for ver in [os.environ['SCHEMA_VERSION'], os.environ.get('SCHEMA_VERSION_TON', 'v1.1')]:
-                      for name, path in discover_blockchains(bucket, ver).items():
-                          if name not in all_blockchains: all_blockchains[name] = path
-                  discovery_method = 'heuristic'
-              
-              print(f"Discovered ({discovery_method}): {list(all_blockchains.keys())}")
-              created_dbs, created_crawlers, created_schedules, started = [], [], [], []
-              
-              for blockchain, s3_path in all_blockchains.items():
-                  db_name, crawler_name = blockchain.lower(), f"{stack_name}-{blockchain.upper()}-Crawler"
-                  db_desc = f'[{stack_name}] {blockchain_descriptions.get(blockchain, f"Auto-discovered {blockchain.upper()} blockchain data")}'
-                  
-                  try: glue.get_database(Name=db_name)
-                  except glue.exceptions.EntityNotFoundException:
-                      glue.create_database(DatabaseInput={'Name': db_name, 'Description': db_desc})
-                      created_dbs.append(db_name)
-                  
-                  schedule_expr, crawler_created = SCHEDULE_MAP.get(default_schedule), False
-                  try: glue.get_crawler(Name=crawler_name)
-                  except glue.exceptions.EntityNotFoundException:
-                      path_parts = [p for p in s3_path.replace('s3://', '').split('/') if p]
-                      table_level = len(path_parts)
-                      cfg = {"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"},"Tables":{"AddOrUpdateBehavior":"MergeNewColumns"}}}
-                      if table_level > 4: cfg["Grouping"] = {"TableGroupingPolicy":"CombineCompatibleSchemas","TableLevelConfiguration":table_level}
-                      params = {'Name':crawler_name,'Role':crawler_role,'DatabaseName':db_name,'Description':f'Crawler for {blockchain}',
-                          'Targets':{'S3Targets':[{'Path':s3_path,'SampleSize':10,'Exclusions':['**/*.xdr','**/*.xdr.zstd','**/*.json','**/*.csv','**/*.txt','**/_SUCCESS','**/_metadata','**/_common_metadata']}]},
-                          'SchemaChangePolicy':{'UpdateBehavior':'LOG','DeleteBehavior':'LOG'},'RecrawlPolicy':{'RecrawlBehavior':'CRAWL_NEW_FOLDERS_ONLY'},'Configuration':json.dumps(cfg)}
-                      if schedule_expr: params['Schedule'] = schedule_expr; created_schedules.append(crawler_name)
-                      glue.create_crawler(**params); created_crawlers.append(crawler_name); crawler_created = True
-                  
-                  if crawler_created:
-                      try:
-                          if glue.get_crawler(Name=crawler_name)['Crawler']['State'] == 'READY':
-                              glue.start_crawler(Name=crawler_name); started.append(crawler_name)
-                      except: pass
-              
-              if created_dbs or created_crawlers:
-                  msg = f"Discovery: {discovery_method}\nChains: {len(all_blockchains)}\nNew DBs: {created_dbs}\nNew Crawlers: {created_crawlers}\nStarted: {started}"
-                  sns.publish(TopicArn=sns_topic, Subject=f"Blockchain Discovery: {len(all_blockchains)} chains", Message=msg)
-              
-              return {'statusCode':200,'body':json.dumps({'discovery_method':discovery_method,'discovered':list(all_blockchains.keys()),'created_databases':created_dbs,'created_crawlers':created_crawlers,'started_crawlers':started})}
-
-  BlockchainDiscoveryRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: BlockchainDiscoveryPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:ListBucket
-                  - s3:GetObject
-                Resource:
-                  - !Sub arn:aws:s3:::${S3Bucket}
-                  - !Sub arn:aws:s3:::${S3Bucket}/*
-              - Effect: Allow
-                Action:
-                  - glue:GetDatabase
-                  - glue:CreateDatabase
-                  - glue:GetCrawler
-                  - glue:CreateCrawler
-                  - glue:StartCrawler
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - iam:PassRole
-                Resource: !GetAtt GlueCrawlerRole.Arn
-              - Effect: Allow
-                Action:
-                  - sns:Publish
-                Resource: !Ref CrawlerNotificationTopic
-
-  # Schedule for blockchain discovery
-  BlockchainDiscoverySchedule:
-    Type: AWS::Events::Rule
-    Condition: EnableCrawling
-    Properties:
-      Name: !Sub ${AWS::StackName}-BlockchainDiscoverySchedule
-      Description: Schedule for discovering new blockchains
-      ScheduleExpression: !Ref DiscoverySchedule
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt BlockchainDiscoveryFunction.Arn
-          Id: BlockchainDiscoveryTarget
-
-  BlockchainDiscoveryPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref BlockchainDiscoveryFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt BlockchainDiscoverySchedule.Arn
-
-  # ============================================================================
-  # Custom Resource to Trigger Initial Discovery on Deployment
-  # ============================================================================
-  
-  InitialDiscoveryTrigger:
-    Type: Custom::InitialDiscovery
-    DependsOn:
-      - BlockchainDiscoveryFunction
-      - GlueCrawlerRole
-      - CrawlerNotificationTopic
-    Properties:
-      ServiceToken: !GetAtt InitialDiscoveryFunction.Arn
-      DiscoveryFunctionName: !Ref BlockchainDiscoveryFunction
-      StackName: !Ref AWS::StackName
+              b, v1, v2 = os.environ['S3_BUCKET'], os.environ['SCHEMA_VERSION'], os.environ.get('SCHEMA_VERSION_TON', 'v1.1')
+              role, stack, topic = os.environ['CRAWLER_ROLE_ARN'], os.environ['STACK_NAME'], os.environ['SNS_TOPIC_ARN']
+              sched = SCHEDULE.get(os.environ.get('DEFAULT_CRAWLER_SCHEDULE', 'disabled'))
+              chains = {**discover(b, v1), **{k: v for k, v in discover(b, v2).items() if k not in discover(b, v1)}}
+              dbs, crs, started = [], [], []
+              for c, path in chains.items():
+                  db, cr = c.lower(), f"{stack}-{c.upper()}-Crawler"
+                  try: glue.get_database(Name=db)
+                  except: glue.create_database(DatabaseInput={'Name': db, 'Description': f'[{stack}] {c.upper()}'}); dbs.append(db)
+                  try: glue.get_crawler(Name=cr)
+                  except:
+                      depth = len([x for x in path.replace('s3://', '').split('/') if x])
+                      cfg = {"Version": 1.0, "CrawlerOutput": {"Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}, "Tables": {"AddOrUpdateBehavior": "MergeNewColumns"}}}
+                      if depth > 4: cfg["Grouping"] = {"TableGroupingPolicy": "CombineCompatibleSchemas", "TableLevelConfiguration": depth}
+                      params = {'Name': cr, 'Role': role, 'DatabaseName': db, 'Targets': {'S3Targets': [{'Path': path, 'SampleSize': 10, 'Exclusions': ['**/*.xdr*', '**/*.json', '**/*.csv', '**/_*']}]}, 'SchemaChangePolicy': {'UpdateBehavior': 'LOG', 'DeleteBehavior': 'LOG'}, 'RecrawlPolicy': {'RecrawlBehavior': 'CRAWL_NEW_FOLDERS_ONLY'}, 'Configuration': json.dumps(cfg)}
+                      if sched: params['Schedule'] = sched
+                      glue.create_crawler(**params); crs.append(cr)
+                      if glue.get_crawler(Name=cr)['Crawler']['State'] == 'READY': glue.start_crawler(Name=cr); started.append(cr)
+              if dbs or crs: sns.publish(TopicArn=topic, Subject=f"Discovery: {len(chains)} chains", Message=f"DBs: {dbs}\nCrawlers: {crs}\nStarted: {started}")
+              return {'statusCode': 200, 'body': json.dumps({'chains': list(chains.keys()), 'dbs': dbs, 'crawlers': crs})}
 
   InitialDiscoveryFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-InitialDiscoveryTrigger
-      Description: Triggers initial blockchain discovery on stack creation and cleanup on deletion
+      Description: Triggers discovery on stack creation, cleanup on deletion
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt InitialDiscoveryRole.Arn
       Timeout: 900
       Code:
         ZipFile: |
-          import boto3
-          import cfnresponse
-          import json
+          import boto3, json, time, urllib.request
+          lam, glue = boto3.client('lambda'), boto3.client('glue')
           
-          lambda_client = boto3.client('lambda')
-          glue = boto3.client('glue')
+          def send_response(event, context, status, data, physical_id):
+              body = json.dumps({'Status': status, 'Reason': f'See CloudWatch Log Stream: {context.log_stream_name}', 'PhysicalResourceId': physical_id, 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data})
+              req = urllib.request.Request(event['ResponseURL'], data=body.encode('utf-8'), headers={'Content-Type': ''}, method='PUT')
+              urllib.request.urlopen(req)
           
-          def cleanup_glue_resources(stack_name):
-              """Delete all Glue crawlers and databases created by this stack."""
-              deleted_crawlers = []
-              deleted_databases = []
-              errors = []
-              
-              # Delete crawlers created by this stack
-              try:
-                  crawlers = glue.list_crawlers()['CrawlerNames']
-                  for crawler_name in crawlers:
-                      if crawler_name.startswith(f"{stack_name}-"):
-                          try:
-                              # Stop crawler if running
-                              try:
-                                  crawler_state = glue.get_crawler(Name=crawler_name)['Crawler']['State']
-                                  if crawler_state == 'RUNNING':
-                                      print(f"Stopping crawler: {crawler_name}")
-                                      glue.stop_crawler(Name=crawler_name)
-                                      # Wait briefly for crawler to stop
-                                      import time
-                                      time.sleep(5)
-                              except Exception as e:
-                                  print(f"Error stopping crawler {crawler_name}: {e}")
-                              
-                              print(f"Deleting crawler: {crawler_name}")
-                              glue.delete_crawler(Name=crawler_name)
-                              deleted_crawlers.append(crawler_name)
-                          except Exception as e:
-                              errors.append(f"Error deleting crawler {crawler_name}: {e}")
-                              print(errors[-1])
-              except Exception as e:
-                  errors.append(f"Error listing crawlers: {e}")
-                  print(errors[-1])
-              
-              # Delete databases (and their tables) created by THIS stack only
-              # Databases are tagged with [stack_name] in their description
-              try:
-                  databases = glue.get_databases()['DatabaseList']
-                  for db in databases:
-                      db_name = db['Name']
-                      description = db.get('Description', '')
-                      # Only delete if description contains our stack name tag
-                      if f'[{stack_name}]' in description:
-                          try:
-                              # Delete all tables in the database first
-                              tables = glue.get_tables(DatabaseName=db_name).get('TableList', [])
-                              for table in tables:
-                                  print(f"Deleting table: {db_name}.{table['Name']}")
-                                  glue.delete_table(DatabaseName=db_name, Name=table['Name'])
-                              
-                              print(f"Deleting database: {db_name}")
-                              glue.delete_database(Name=db_name)
-                              deleted_databases.append(db_name)
-                          except Exception as e:
-                              errors.append(f"Error deleting database {db_name}: {e}")
-                              print(errors[-1])
-              except Exception as e:
-                  errors.append(f"Error listing databases: {e}")
-                  print(errors[-1])
-              
-              return {
-                  'deleted_crawlers': deleted_crawlers,
-                  'deleted_databases': deleted_databases,
-                  'errors': errors
-              }
+          def cleanup(stack):
+              for cr in glue.list_crawlers().get('CrawlerNames', []):
+                  if cr.startswith(f"{stack}-"):
+                      try:
+                          if glue.get_crawler(Name=cr)['Crawler']['State'] == 'RUNNING': glue.stop_crawler(Name=cr); time.sleep(5)
+                          glue.delete_crawler(Name=cr)
+                      except: pass
+              for db in glue.get_databases().get('DatabaseList', []):
+                  if f'[{stack}]' in db.get('Description', ''):
+                      try:
+                          for t in glue.get_tables(DatabaseName=db['Name']).get('TableList', []): glue.delete_table(DatabaseName=db['Name'], Name=t['Name'])
+                          glue.delete_database(Name=db['Name'])
+                      except: pass
           
           def handler(event, context):
-              print(f"Event: {json.dumps(event)}")
-              
-              request_type = event['RequestType']
-              discovery_function = event['ResourceProperties']['DiscoveryFunctionName']
-              stack_name = event['ResourceProperties']['StackName']
-              
               try:
-                  if request_type == 'Create':
-                      # Invoke discovery function on stack creation
-                      print(f"Invoking discovery function: {discovery_function}")
-                      response = lambda_client.invoke(
-                          FunctionName=discovery_function,
-                          InvocationType='RequestResponse',
-                          Payload=json.dumps({'trigger': 'initial_deployment'})
-                      )
-                      
-                      payload = json.loads(response['Payload'].read())
-                      print(f"Discovery response: {json.dumps(payload)}")
-                      
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
-                                      {'Result': 'Initial discovery completed'},
-                                      physicalResourceId='InitialDiscovery')
-                  
-                  elif request_type == 'Update':
-                      # Optionally re-run discovery on stack update
-                      print("Stack update - skipping discovery (run manually if needed)")
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
-                                      {'Result': 'Update - no action'},
-                                      physicalResourceId='InitialDiscovery')
-                  
-                  elif request_type == 'Delete':
-                      # Clean up Glue resources created by this stack
-                      print(f"Stack delete - cleaning up Glue resources for stack: {stack_name}")
-                      cleanup_result = cleanup_glue_resources(stack_name)
-                      print(f"Cleanup result: {json.dumps(cleanup_result)}")
-                      
-                      # Always succeed on delete to not block stack deletion
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
-                                      {'Result': f"Cleanup completed. Deleted {len(cleanup_result['deleted_crawlers'])} crawlers and {len(cleanup_result['deleted_databases'])} databases"},
-                                      physicalResourceId='InitialDiscovery')
-                      
+                  if event['RequestType'] == 'Create':
+                      lam.invoke(FunctionName=event['ResourceProperties']['DiscoveryFunctionName'], InvocationType='RequestResponse', Payload=json.dumps({}))
+                      send_response(event, context, 'SUCCESS', {'Result': 'OK'}, 'InitialDiscovery')
+                  elif event['RequestType'] == 'Delete':
+                      cleanup(event['ResourceProperties']['StackName'])
+                      send_response(event, context, 'SUCCESS', {'Result': 'Cleaned'}, 'InitialDiscovery')
+                  else: send_response(event, context, 'SUCCESS', {'Result': 'NoOp'}, 'InitialDiscovery')
               except Exception as e:
-                  print(f"Error: {e}")
-                  # On delete, always succeed to not block stack deletion
-                  if request_type == 'Delete':
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
-                                      {'Result': f'Delete completed with errors: {str(e)}'},
-                                      physicalResourceId='InitialDiscovery')
-                  else:
-                      cfnresponse.send(event, context, cfnresponse.FAILED,
-                                      {'Error': str(e)},
-                                      physicalResourceId='InitialDiscovery')
-
-  InitialDiscoveryRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: InvokeDiscoveryPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource: !GetAtt BlockchainDiscoveryFunction.Arn
-        - PolicyName: GlueCleanupPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - glue:ListCrawlers
-                  - glue:GetCrawler
-                  - glue:StopCrawler
-                  - glue:DeleteCrawler
-                  - glue:GetDatabases
-                  - glue:GetTables
-                  - glue:DeleteTable
-                  - glue:DeleteDatabase
-                Resource: '*'
-
-  # ============================================================================
-  # Lambda for Post-Crawler Processing
-  # ============================================================================
-  
-  CrawlerCompletionHandlerRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: GlueAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - glue:GetCrawler
-                  - glue:GetDatabase
-                  - glue:GetTable
-                  - glue:GetTables
-                  - glue:UpdateTable
-                Resource: '*'
-        - PolicyName: SNSPublish
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - sns:Publish
-                Resource: !Ref CrawlerNotificationTopic
+                  if event['RequestType'] == 'Delete': send_response(event, context, 'SUCCESS', {'Result': str(e)}, 'InitialDiscovery')
+                  else: send_response(event, context, 'FAILED', {'Error': str(e)}, 'InitialDiscovery')
 
   CrawlerCompletionHandler:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-CrawlerCompletionHandler
-      Description: Processes crawler completion events and sends notifications
+      Description: Adds partition projection after crawler completes
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt CrawlerCompletionHandlerRole.Arn
+      Role: !GetAtt CrawlerCompletionRole.Arn
       Timeout: 300
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref CrawlerNotificationTopic
+          S3_BUCKET: !Ref S3Bucket
       Code:
         ZipFile: |
-          import json
-          import boto3
-          import os
+          import boto3, json, os
           from datetime import datetime
+          glue, s3, sns = boto3.client('glue'), boto3.client('s3'), boto3.client('sns')
           
-          glue = boto3.client('glue')
-          sns = boto3.client('sns')
-          
-          def dedupe_table_schema(database_name, table_name):
-              """Remove columns that collide with partition keys (case-insensitive)."""
+          def oldest_date(loc):
               try:
-                  resp = glue.get_table(DatabaseName=database_name, Name=table_name)
-                  table = resp['Table']
-                  partition_keys = {pk['Name'].lower() for pk in table.get('PartitionKeys', [])}
-                  if not partition_keys:
-                      return None
-                  
-                  sd = table['StorageDescriptor']
-                  original_cols = sd.get('Columns', [])
-                  filtered_cols = [c for c in original_cols if c['Name'].lower() not in partition_keys]
-                  removed = [c['Name'] for c in original_cols if c['Name'].lower() in partition_keys]
-                  
-                  if not removed:
-                      return None
-                  
-                  # Build TableInput from existing table, keeping only mutable fields
-                  table_input = {
-                      'Name': table['Name'],
-                      'StorageDescriptor': {**sd, 'Columns': filtered_cols},
-                  }
-                  for key in ['Description', 'Owner', 'Retention', 'PartitionKeys', 'TableType', 'Parameters', 'ViewOriginalText', 'ViewExpandedText']:
-                      if key in table:
-                          table_input[key] = table[key]
-                  
-                  glue.update_table(DatabaseName=database_name, TableInput=table_input)
+                  parts = loc.replace('s3://', '').split('/', 1)
+                  r = s3.list_objects_v2(Bucket=parts[0], Prefix=parts[1].rstrip('/')+'/date=', Delimiter='/', MaxKeys=1, RequestPayer='requester')
+                  for p in r.get('CommonPrefixes', []):
+                      f = p['Prefix'].rstrip('/').split('/')[-1]
+                      if f.startswith('date='): return f.split('=')[1]
+              except: pass
+              return None
+          
+          def dedupe(db, tbl):
+              try:
+                  t = glue.get_table(DatabaseName=db, Name=tbl)['Table']
+                  pkeys = {pk['Name'].lower() for pk in t.get('PartitionKeys', [])}
+                  if not pkeys: return None
+                  sd = t['StorageDescriptor']
+                  orig = sd.get('Columns', [])
+                  filt = [c for c in orig if c['Name'].lower() not in pkeys]
+                  removed = [c['Name'] for c in orig if c['Name'].lower() in pkeys]
+                  if not removed: return None
+                  inp = {'Name': t['Name'], 'StorageDescriptor': {**sd, 'Columns': filt}}
+                  for k in ['Description', 'Owner', 'Retention', 'PartitionKeys', 'TableType', 'Parameters']:
+                      if k in t: inp[k] = t[k]
+                  glue.update_table(DatabaseName=db, TableInput=inp)
                   return removed
-              except Exception as e:
-                  print(f"Error deduping {database_name}.{table_name}: {e}")
-                  return None
+              except: return None
+          
+          def add_proj(db, tbl):
+              try:
+                  t = glue.get_table(DatabaseName=db, Name=tbl)['Table']
+                  if 'date' not in [pk['Name'].lower() for pk in t.get('PartitionKeys', [])]: return None
+                  params = t.get('Parameters', {})
+                  if params.get('projection.enabled') == 'true': return None
+                  loc = t['StorageDescriptor']['Location'].rstrip('/')
+                  start = oldest_date(loc) or '2020-01-01'
+                  params.update({'projection.enabled': 'true', 'projection.date.type': 'date', 'projection.date.range': f'{start},NOW', 'projection.date.format': 'yyyy-MM-dd', 'projection.date.interval': '1', 'projection.date.interval.unit': 'DAYS', 'storage.location.template': f'{loc}/date=${{date}}'})
+                  inp = {'Name': t['Name'], 'StorageDescriptor': t['StorageDescriptor'], 'Parameters': params}
+                  for k in ['Description', 'Owner', 'Retention', 'PartitionKeys', 'TableType']:
+                      if k in t: inp[k] = t[k]
+                  glue.update_table(DatabaseName=db, TableInput=inp)
+                  return {'start': start}
+              except: return None
           
           def handler(event, context):
-              print(f"Received event: {json.dumps(event)}")
-              
-              crawler_name = event['detail']['crawlerName']
-              state = event['detail']['state']
-              
-              if state != 'Succeeded':
-                  print(f"Crawler {crawler_name} did not succeed. State: {state}")
-                  return
-              
-              # Get crawler details
-              crawler = glue.get_crawler(Name=crawler_name)
-              database_name = crawler['Crawler']['DatabaseName']
-              
-              # Get all tables in the database (with pagination)
-              tables = []
-              paginator = glue.get_paginator('get_tables')
-              for page in paginator.paginate(DatabaseName=database_name):
-                  tables.extend(page.get('TableList', []))
-              
-              # De-dupe schemas
-              schema_updates = {}
-              for table in tables:
-                  removed = dedupe_table_schema(database_name, table['Name'])
-                  if removed:
-                      schema_updates[table['Name']] = removed
-              
-              # Build notification message
-              message_parts = [
-                  f"Crawler Completion Report",
-                  f"========================",
-                  f"Crawler: {crawler_name}",
-                  f"Database: {database_name}",
-                  f"Completion Time: {datetime.now().isoformat()}",
-                  f"",
-                  f"Discovered Tables: {len(tables)}",
-                  f""
-              ]
-              
-              for table in tables:
-                  table_name = table['Name']
-                  # Get updated column count (after deduplication)
-                  col_count = len(table['StorageDescriptor']['Columns'])
-                  if table_name in schema_updates:
-                      col_count -= len(schema_updates[table_name])
-                  location = table['StorageDescriptor']['Location']
-                  
-                  message_parts.append(f"  • {table_name}")
-                  message_parts.append(f"    - Columns: {col_count}")
-                  message_parts.append(f"    - Location: {location}")
-                  message_parts.append("")
-              
-              if schema_updates:
-                  message_parts.append("Schema De-duplication:")
-                  for tbl, cols in schema_updates.items():
-                      message_parts.append(f"  • {tbl}: removed {cols}")
-                  message_parts.append("")
-              
-              message = "\n".join(message_parts)
-              
-              # Send SNS notification
-              sns.publish(
-                  TopicArn=os.environ['SNS_TOPIC_ARN'],
-                  Subject=f"Glue Crawler Completed: {crawler_name}",
-                  Message=message
-              )
-              
-              print(f"Notification sent for crawler: {crawler_name}")
-              return {
-                  'statusCode': 200,
-                  'body': json.dumps('Processing complete')
-              }
+              cr, state = event['detail']['crawlerName'], event['detail']['state']
+              if state != 'Succeeded': return {'statusCode': 200}
+              db = glue.get_crawler(Name=cr)['Crawler']['DatabaseName']
+              tables = [t for pg in glue.get_paginator('get_tables').paginate(DatabaseName=db) for t in pg.get('TableList', [])]
+              proj = {}
+              for t in tables:
+                  dedupe(db, t['Name'])
+                  r = add_proj(db, t['Name'])
+                  if r: proj[t['Name']] = r
+              msg = f"Crawler: {cr}\nDatabase: {db}\nTables: {len(tables)}\nProjection enabled: {list(proj.keys())}"
+              sns.publish(TopicArn=os.environ['SNS_TOPIC_ARN'], Subject=f"Crawler Complete: {cr}", Message=msg)
+              return {'statusCode': 200}
 
-  # ============================================================================
-  # EventBridge Rule for Crawler State Changes
-  # ============================================================================
+  # ==========================================================================
+  # EventBridge and Custom Resources
+  # ==========================================================================
   
+  BlockchainDiscoverySchedule:
+    Type: AWS::Events::Rule
+    Condition: EnableCrawling
+    Properties:
+      Name: !Sub ${AWS::StackName}-DiscoverySchedule
+      Description: Weekly blockchain discovery
+      ScheduleExpression: !Ref DiscoverySchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BlockchainDiscoveryFunction.Arn
+          Id: DiscoveryTarget
+
+  BlockchainDiscoveryPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableCrawling
+    Properties:
+      FunctionName: !Ref BlockchainDiscoveryFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BlockchainDiscoverySchedule.Arn
+
+  InitialDiscoveryTrigger:
+    Type: Custom::InitialDiscovery
+    DependsOn: [BlockchainDiscoveryFunction, GlueCrawlerRole, CrawlerNotificationTopic]
+    Properties:
+      ServiceToken: !GetAtt InitialDiscoveryFunction.Arn
+      DiscoveryFunctionName: !Ref BlockchainDiscoveryFunction
+      StackName: !Ref AWS::StackName
+
   CrawlerStateChangeRule:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub ${AWS::StackName}-CrawlerStateChange
-      Description: Trigger Lambda when crawlers complete
+      Description: Trigger completion handler when crawlers finish
       EventPattern:
-        source:
-          - aws.glue
-        detail-type:
-          - Glue Crawler State Change
+        source: [aws.glue]
+        detail-type: [Glue Crawler State Change]
         detail:
-          state:
-            - Succeeded
-            - Failed
+          state: [Succeeded, Failed]
           crawlerName:
             - prefix: !Ref AWS::StackName
       State: ENABLED
       Targets:
         - Arn: !GetAtt CrawlerCompletionHandler.Arn
-          Id: CrawlerCompletionHandlerTarget
+          Id: CompletionTarget
 
-  CrawlerCompletionHandlerPermission:
+  CrawlerCompletionPermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref CrawlerCompletionHandler
@@ -778,47 +511,29 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt CrawlerStateChangeRule.Arn
 
-  # ============================================================================
-  # SNS Topic for Notifications
-  # ============================================================================
+  # ==========================================================================
+  # SNS and SSM
+  # ==========================================================================
   
   CrawlerNotificationTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: !Sub ${AWS::StackName}-CrawlerNotifications
-      DisplayName: Blockchain Crawler Notifications
+      TopicName: !Sub ${AWS::StackName}-Notifications
       KmsMasterKeyId: alias/aws/sns
 
-  # ============================================================================
-  # SSM Parameters (matching original template naming convention)
-  # ============================================================================
-  
   BucketNameParameter:
     Type: AWS::SSM::Parameter
     Properties:
-      Name: public-blockchain-bucket
-      Description: AWS Public Blockchain S3 bucket
+      Name: !Sub /${AWS::StackName}/bucket
       Type: String
       Value: !Ref S3Bucket
 
   SchemaVersionParameter:
     Type: AWS::SSM::Parameter
     Properties:
-      Name: public-blockchain-schema-version
-      Description: AWS Public Blockchain Schema Version
+      Name: !Sub /${AWS::StackName}/schema-version
       Type: String
       Value: !Ref SchemaVersion
-
-  SchemaVersionParameterTON:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: public-blockchain-schema-version-ton
-      Description: AWS Public Blockchain Schema Version for TON
-      Type: String
-      Value: !Ref SchemaVersionTON
-
-Conditions:
-  EnableCrawling: !Equals [!Ref EnableAutoCrawling, "true"]
 
 Outputs:
   AthenaResultsBucket:
@@ -826,27 +541,23 @@ Outputs:
     Value: !Ref AthenaResultsBucket
     Export:
       Name: !Sub ${AWS::StackName}-AthenaResultsBucket
-
   AthenaWorkgroup:
     Description: Athena workgroup for blockchain queries
     Value: !Ref AthenaWorkgroup
     Export:
       Name: !Sub ${AWS::StackName}-AthenaWorkgroup
-
   BlockchainDiscoveryFunction:
-    Description: Lambda function for discovering new blockchains
+    Description: Lambda function for blockchain discovery
     Value: !Ref BlockchainDiscoveryFunction
     Export:
       Name: !Sub ${AWS::StackName}-DiscoveryFunction
-
   CrawlerNotificationTopicArn:
-    Description: SNS topic for crawler notifications
+    Description: SNS topic for notifications
     Value: !Ref CrawlerNotificationTopic
     Export:
       Name: !Sub ${AWS::StackName}-NotificationTopic
-
   GlueCrawlerRoleArn:
-    Description: IAM role ARN for Glue crawlers
+    Description: IAM role for Glue crawlers
     Value: !GetAtt GlueCrawlerRole.Arn
     Export:
       Name: !Sub ${AWS::StackName}-CrawlerRole

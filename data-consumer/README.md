@@ -14,19 +14,25 @@ CloudFormation templates for deploying the AWS infrastructure to consume and que
 ### Deploy with Automatic Schema Discovery (Recommended)
 
 ```bash
-aws cloudformation create-stack \
-  --stack-name blockchain-crawlers \
-  --template-body file://data-consumer/aws-public-blockchain-with-crawlers.yaml \
-  --capabilities CAPABILITY_NAMED_IAM
+# Package Lambda code and upload to S3
+aws cloudformation package \
+  --template-file data-consumer/aws-public-blockchain-with-crawlers.yaml \
+  --s3-bucket YOUR_DEPLOYMENT_BUCKET \
+  --output-template-file packaged.yaml
 
-aws cloudformation wait stack-create-complete --stack-name blockchain-crawlers
+# Deploy the packaged template
+aws cloudformation deploy \
+  --template-file packaged.yaml \
+  --stack-name blockchain-crawlers \
+  --capabilities CAPABILITY_NAMED_IAM
 ```
 
 The stack automatically:
-- Discovers all blockchains in the S3 bucket
-- Creates a dedicated database per blockchain (btc, eth, ton, etc.)
-- Creates and starts crawlers to infer schemas
-- Sets up configurable schedules per chain
+- Fetches the [manifest.json](https://aws-public-blockchain.s3.us-east-2.amazonaws.com/manifest.json) for authoritative chain names
+- Creates a dedicated database per blockchain using manifest names (e.g., `aws_bitcoin_mainnet`)
+- Falls back to S3 heuristic scanning for chains not in the manifest
+- Runs crawlers once to infer schemas, then enables partition projection
+- No ongoing crawler costs — Athena calculates partitions in-memory
 
 ### Subscribe to Notifications
 
@@ -46,8 +52,8 @@ aws sns subscribe \
 
 ```sql
 SHOW DATABASES;
-SHOW TABLES IN btc;
-SELECT * FROM btc.blocks WHERE date = '2024-01-01' LIMIT 10;
+SHOW TABLES IN aws_bitcoin_mainnet;
+SELECT * FROM aws_bitcoin_mainnet.blocks WHERE date = '2024-01-01' LIMIT 10;
 ```
 
 ---
@@ -57,70 +63,64 @@ SELECT * FROM btc.blocks WHERE date = '2024-01-01' LIMIT 10;
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                  AWS Public Blockchain S3                    │
+│              + manifest.json (chain names & paths)          │
 └─────────────────────────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────────┐
 │              BlockchainDiscoveryFunction (Lambda)            │
-│  - Scans S3 for blockchain namespaces                       │
-│  - Creates database per blockchain                          │
-│  - Creates crawler per blockchain                           │
-│  - Creates EventBridge schedule per crawler                 │
+│  1. Fetches manifest.json for authoritative chain names     │
+│  2. Falls back to S3 heuristic for unlisted chains          │
+│  3. Creates database per chain (manifest naming)            │
+│  4. Creates crawler per chain, starts it ONCE               │
 └─────────────────────────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────────┐
-│              EventBridge Schedules (per chain)               │
-│  BTC: daily | ETH: hourly | TON: 10min | etc.              │
+│           AWS Glue Crawlers (one-time execution)             │
+│  Infers schema from Parquet metadata, then disabled         │
 └─────────────────────────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                    AWS Glue Crawlers                         │
-│       BTC-Crawler | ETH-Crawler | TON-Crawler | etc.        │
+│              CrawlerCompletionHandler (Lambda)               │
+│  Adds partition projection → no more crawling needed        │
 └─────────────────────────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                  AWS Glue Data Catalog                       │
-│              btc | eth | ton | (auto-created)               │
+│  aws_bitcoin_mainnet | aws_ethereum_mainnet | ton_mainnet   │
+│  stellar_pubnet | sonarx_arbitrum_mainnet | etc.            │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     Amazon Athena                            │
+│  Partition projection: calculates partitions in-memory      │
+│  New date partitions discovered automatically               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Managing Crawler Schedules
+## Managing Crawlers
 
-Each blockchain crawler has its own configurable schedule.
-
-### Available Schedules
-
-| Schedule | Expression | Est. Cost/Chain/Month |
-|----------|------------|----------------------|
-| `1min` | Every minute | $50-100+ |
-| `10min` | Every 10 minutes | $5-10 |
-| `hourly` | Every hour | $1-2 |
-| `daily` | Every day | $0.50 (default) |
-
-### List All Schedules
-
-```bash
-aws lambda invoke \
-  --function-name blockchain-crawlers-CrawlerScheduleManager \
-  --payload '{"action": "list"}' \
-  response.json --no-cli-pager && cat response.json
-```
-
-### Set Schedule for a Blockchain
-
-```bash
-# Set BTC to hourly
-aws lambda invoke \
-  --function-name blockchain-crawlers-CrawlerScheduleManager \
-  --payload '{"action": "set", "blockchain": "BTC", "schedule": "hourly"}' \
-  response.json --no-cli-pager
-```
+Crawlers run once on initial discovery. Partition projection handles new date partitions automatically. Re-run crawlers only if schema changes.
 
 ### Manually Trigger a Crawler
 
 ```bash
-aws glue start-crawler --name blockchain-crawlers-BTC-Crawler
+aws glue start-crawler --name blockchain-crawlers-AWS_BITCOIN_MAINNET-Crawler
+```
+
+### Enable Scheduled Crawling (if needed)
+
+| Schedule | Cron Expression | Est. Cost/Chain/Month |
+|----------|-----------------|----------------------|
+| Weekly | `cron(0 0 ? * SUN *)` | $0.12 |
+| Daily | `cron(0 0 * * ? *)` | $0.50 |
+| Hourly | `cron(0 * * * ? *)` | $1-2 |
+
+```bash
+aws glue update-crawler \
+  --name blockchain-crawlers-AWS_BITCOIN_MAINNET-Crawler \
+  --schedule "cron(0 0 ? * SUN *)"
 ```
 
 ---
@@ -133,7 +133,7 @@ aws glue start-crawler --name blockchain-crawlers-BTC-Crawler
 | `SchemaVersion` | v1.0 | Schema version for BTC/ETH |
 | `SchemaVersionTON` | v1.1 | Schema version for TON |
 | `DiscoverySchedule` | Weekly (Sunday 2AM) | How often to scan for new blockchains |
-| `DefaultCrawlerSchedule` | daily | Default schedule for new crawlers |
+| `DefaultCrawlerSchedule` | disabled | Default crawler schedule (partition projection handles new partitions) |
 | `EnableAutoCrawling` | true | Enable/disable automatic scheduling |
 
 ---

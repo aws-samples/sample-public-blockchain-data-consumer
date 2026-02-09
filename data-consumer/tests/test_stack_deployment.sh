@@ -91,21 +91,20 @@ echo "Test 3: Glue Databases (Manifest Coverage)"
 
 DATABASES=$(aws glue get-databases --query 'DatabaseList[*].Name' --output text)
 
-# Expected chains from AWS Public Blockchain registry
-# https://registry.opendata.aws/aws-public-blockchain
-# Note: sonarx chains create databases like sonarx_arbitrum, sonarx_aptos, etc.
-# Stellar creates stellar_pubnet and stellar_testnet
+# Expected chains from manifest.json
+# https://aws-public-blockchain.s3.us-east-2.amazonaws.com/manifest.json
 EXPECTED_CHAINS=(
-    "btc"
-    "eth"
-    "ton"
-    "cronos"
-    "sonarx_arbitrum"
-    "sonarx_aptos"
-    "sonarx_base"
-    "sonarx_provenance"
-    "sonarx_xrp"
+    "aws_bitcoin_mainnet"
+    "aws_ethereum_mainnet"
+    "ton_mainnet"
+    "cronos_mainnet"
     "stellar_pubnet"
+    "stellar_testnet"
+    "sonarx_aptos_mainnet"
+    "sonarx_arbitrum_mainnet"
+    "sonarx_base_mainnet"
+    "sonarx_provenance_mainnet"
+    "sonarx_xrp_mainnet"
 )
 
 info "Checking manifest coverage for ${#EXPECTED_CHAINS[@]} expected chains"
@@ -149,8 +148,8 @@ for CRAWLER in $STACK_CRAWLERS; do
     STATE=$(aws glue get-crawler --name "$CRAWLER" --query 'Crawler.State' --output text 2>/dev/null || echo "ERROR")
     if [[ "$STATE" == "READY" ]]; then
         pass "Crawler $CRAWLER state is READY"
-    elif [[ "$STATE" == "RUNNING" ]]; then
-        skip "Crawler $CRAWLER is still RUNNING (wait for completion)"
+    elif [[ "$STATE" == "RUNNING" || "$STATE" == "STOPPING" ]]; then
+        skip "Crawler $CRAWLER is $STATE (wait for completion)"
     else
         fail "Crawler $CRAWLER state is $STATE"
     fi
@@ -306,58 +305,115 @@ for FUNC_SUFFIX in BlockchainDiscovery CrawlerCompletionHandler InitialDiscovery
 done
 
 # =============================================================================
-# Test 9: Athena query test (optional - requires data)
+# Test 9: Schema Accuracy Validation (All Tables)
 # =============================================================================
 echo ""
-echo "Test 9: Athena Query Validation"
+echo "Test 9: Schema Accuracy Validation"
 
-# Only run if btc.blocks exists with projection
-if aws glue get-table --database-name btc --name blocks &>/dev/null; then
-    RESULTS_BUCKET=$(aws cloudformation describe-stacks \
-        --stack-name "$STACK_NAME" \
-        --query 'Stacks[0].Outputs[?OutputKey==`AthenaResultsBucket`].OutputValue' \
-        --output text)
+# Run a SELECT * LIMIT 1 query on every table in every expected database
+# If schema is wrong or data is unreadable, query fails
+
+SCHEMA_VALIDATED=0
+SCHEMA_FAILED=0
+SCHEMA_SKIPPED=0
+
+validate_table_schema() {
+    local DB=$1
+    local TABLE=$2
     
-    # Run a simple query to validate partition projection works
+    # Build query - use a recent date partition if table has date partitioning
+    local HAS_DATE
+    HAS_DATE=$(aws glue get-table --database-name "$DB" --name "$TABLE" \
+        --query "Table.PartitionKeys[?Name=='date'].Name" --output text 2>/dev/null) || HAS_DATE=""
+    
+    local QUERY
+    if [[ -n "$HAS_DATE" ]]; then
+        QUERY="SELECT * FROM ${DB}.${TABLE} WHERE date >= '2024-01-01' LIMIT 1"
+    else
+        QUERY="SELECT * FROM ${DB}.${TABLE} LIMIT 1"
+    fi
+    
+    local QUERY_ID
     QUERY_ID=$(aws athena start-query-execution \
-        --query-string "SELECT COUNT(*) FROM btc.blocks WHERE date = '2024-01-01'" \
+        --query-string "$QUERY" \
         --work-group "$WORKGROUP" \
         --query 'QueryExecutionId' \
         --output text 2>/dev/null || echo "")
     
-    if [[ -n "$QUERY_ID" ]]; then
-        info "Started query: $QUERY_ID"
-        
-        # Wait for query (max 30 seconds)
-        for i in {1..6}; do
-            sleep 5
-            STATUS=$(aws athena get-query-execution \
-                --query-execution-id "$QUERY_ID" \
-                --query 'QueryExecution.Status.State' \
-                --output text 2>/dev/null || echo "UNKNOWN")
-            
-            if [[ "$STATUS" == "SUCCEEDED" ]]; then
-                pass "Athena query succeeded (partition projection working)"
-                break
-            elif [[ "$STATUS" == "FAILED" || "$STATUS" == "CANCELLED" ]]; then
-                REASON=$(aws athena get-query-execution \
-                    --query-execution-id "$QUERY_ID" \
-                    --query 'QueryExecution.Status.StateChangeReason' \
-                    --output text 2>/dev/null || echo "Unknown")
-                fail "Athena query $STATUS: $REASON"
-                break
-            fi
-            info "Query status: $STATUS (waiting...)"
-        done
-        
-        if [[ "$STATUS" == "RUNNING" || "$STATUS" == "QUEUED" ]]; then
-            skip "Query still running after 30s"
-        fi
-    else
-        skip "Could not start Athena query"
+    if [[ -z "$QUERY_ID" ]]; then
+        info "$DB.$TABLE: could not start query"
+        ((SCHEMA_SKIPPED++)) || true
+        return
     fi
+    
+    # Wait for query (max 60 seconds)
+    local STATUS="RUNNING"
+    for i in {1..12}; do
+        sleep 5
+        STATUS=$(aws athena get-query-execution \
+            --query-execution-id "$QUERY_ID" \
+            --query 'QueryExecution.Status.State' \
+            --output text 2>/dev/null || echo "UNKNOWN")
+        
+        if [[ "$STATUS" == "SUCCEEDED" ]]; then
+            ((SCHEMA_VALIDATED++)) || true
+            return
+        elif [[ "$STATUS" == "FAILED" || "$STATUS" == "CANCELLED" ]]; then
+            local REASON
+            REASON=$(aws athena get-query-execution \
+                --query-execution-id "$QUERY_ID" \
+                --query 'QueryExecution.Status.StateChangeReason' \
+                --output text 2>/dev/null || echo "Unknown")
+            info "$DB.$TABLE: FAILED - $REASON"
+            ((SCHEMA_FAILED++)) || true
+            return
+        fi
+    done
+    
+    info "$DB.$TABLE: query timed out"
+    ((SCHEMA_SKIPPED++)) || true
+}
+
+info "Validating schema for all tables in all expected databases..."
+info "This may take several minutes..."
+echo ""
+
+for DB in "${EXPECTED_CHAINS[@]}"; do
+    # Skip if database doesn't exist
+    if ! echo "$DATABASES" | grep -qw "$DB"; then
+        info "$DB: database not found, skipping"
+        continue
+    fi
+    
+    # Get all tables in database
+    TABLES=$(aws glue get-tables --database-name "$DB" --query 'TableList[*].Name' --output text 2>/dev/null) || TABLES=""
+    
+    if [[ -z "$TABLES" ]]; then
+        info "$DB: no tables found"
+        continue
+    fi
+    
+    TABLE_COUNT=$(echo "$TABLES" | wc -w | tr -d ' ')
+    info "$DB: validating $TABLE_COUNT tables..."
+    
+    for TABLE in $TABLES; do
+        validate_table_schema "$DB" "$TABLE"
+    done
+done
+
+echo ""
+if [[ $SCHEMA_VALIDATED -gt 0 ]]; then
+    pass "$SCHEMA_VALIDATED tables validated successfully"
 else
-    skip "btc.blocks table not available for query test"
+    fail "No tables were validated"
+fi
+
+if [[ $SCHEMA_FAILED -gt 0 ]]; then
+    fail "$SCHEMA_FAILED tables failed schema validation"
+fi
+
+if [[ $SCHEMA_SKIPPED -gt 0 ]]; then
+    skip "$SCHEMA_SKIPPED tables skipped (timeout or unavailable)"
 fi
 
 # =============================================================================

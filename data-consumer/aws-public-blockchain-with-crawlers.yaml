@@ -31,14 +31,9 @@ Parameters:
     Default: "true"
     AllowedValues: ["true", "false"]
     Description: Enable automatic discovery scheduling
-  LambdaBucket:
-    Type: String
-    Default: ""
-    Description: S3 bucket containing Lambda code (leave empty for inline code)
 
 Conditions:
   EnableCrawling: !Equals [!Ref EnableAutoCrawling, "true"]
-  UseS3Lambda: !Not [!Equals [!Ref LambdaBucket, ""]]
 
 Resources:
   # ==========================================================================
@@ -158,7 +153,7 @@ Resources:
                   - !Sub arn:aws:s3:::${S3Bucket}
                   - !Sub arn:aws:s3:::${S3Bucket}/*
               - Effect: Allow
-                Action: [glue:GetDatabase, glue:CreateDatabase, glue:GetCrawler, glue:CreateCrawler, glue:StartCrawler]
+                Action: [glue:GetDatabase, glue:CreateDatabase, glue:DeleteDatabase, glue:GetCrawler, glue:CreateCrawler, glue:DeleteCrawler, glue:StartCrawler]
                 Resource: '*'
               - Effect: Allow
                 Action: iam:PassRole
@@ -255,81 +250,7 @@ Resources:
           STACK_NAME: !Ref AWS::StackName
           SNS_TOPIC_ARN: !Ref CrawlerNotificationTopic
           DEFAULT_CRAWLER_SCHEDULE: !Ref DefaultCrawlerSchedule
-      Code:
-        ZipFile: |
-          import boto3, json, os
-          glue, s3, sns = boto3.client('glue'), boto3.client('s3'), boto3.client('sns')
-          SCHEDULE = {'hourly': 'cron(0 * * * ? *)', 'daily': 'cron(0 0 * * ? *)', 'weekly': 'cron(0 0 ? * SUN *)', 'disabled': None}
-          TABLES = {'blocks', 'transactions', 'logs', 'traces', 'token_transfers', 'contracts', 'messages'}
-          NETWORKS = {'pubnet', 'testnet', 'mainnet'}
-          VERSIONS = {'v1', 'v2', 'v3'}
-          
-          def has_parts(b, p):
-              try:
-                  r = s3.list_objects_v2(Bucket=b, Prefix=p, Delimiter='/', MaxKeys=10, RequestPayer='requester')
-                  return any('=' in x['Prefix'].split('/')[-2] for x in r.get('CommonPrefixes', []))
-              except: return False
-          
-          def is_chain(b, p):
-              try:
-                  r = s3.list_objects_v2(Bucket=b, Prefix=p, Delimiter='/', MaxKeys=20, RequestPayer='requester')
-                  fs = [x['Prefix'].rstrip('/').split('/')[-1].lower() for x in r.get('CommonPrefixes', [])]
-                  if 'parquet' in fs: return False
-                  return any(f in TABLES or f in VERSIONS or f.startswith('date=') for f in fs)
-              except: return False
-          
-          def scan(b, p, n, found, pag, d=0):
-              if d > 5: return
-              try:
-                  all_p = [(x['Prefix'], x['Prefix'].rstrip('/').split('/')[-1].lower()) for pg in pag.paginate(Bucket=b, Prefix=p, Delimiter='/', RequestPayer='requester') for x in pg.get('CommonPrefixes', [])]
-                  pq = next((x for x, f in all_p if f == 'parquet'), None)
-                  if pq: scan(b, pq, n, found, pag, d+1); return
-                  for sp, f in all_p:
-                      if f in VERSIONS:
-                          if has_parts(b, sp) and n not in found: found[n] = f"s3://{b}/{sp}"
-                          else: scan(b, sp, n, found, pag, d+1)
-                      elif '=' in f: continue
-                      elif is_chain(b, sp):
-                          if f in NETWORKS: scan(b, sp, f"{n}_{f}", found, pag, d+1)
-                          elif f in TABLES:
-                              if n not in found: found[n] = f"s3://{b}/{p}"; return
-                          else:
-                              if f"{n}_{f}" not in found: found[f"{n}_{f}"] = f"s3://{b}/{sp}"
-                      elif f in NETWORKS: scan(b, sp, f"{n}_{f}", found, pag, d+1)
-              except: pass
-          
-          def discover(b, v):
-              found, pag = {}, s3.get_paginator('list_objects_v2')
-              try:
-                  for pg in pag.paginate(Bucket=b, Prefix=f"{v}/", Delimiter='/', RequestPayer='requester'):
-                      for x in pg.get('CommonPrefixes', []):
-                          p, n = x['Prefix'], x['Prefix'].strip('/').split('/')[1].lower()
-                          if is_chain(b, p): found[n] = f"s3://{b}/{p}"
-                          else: scan(b, p, n, found, pag)
-              except: pass
-              return found
-          
-          def handler(event, context):
-              b, v1, v2 = os.environ['S3_BUCKET'], os.environ['SCHEMA_VERSION'], os.environ.get('SCHEMA_VERSION_TON', 'v1.1')
-              role, stack, topic = os.environ['CRAWLER_ROLE_ARN'], os.environ['STACK_NAME'], os.environ['SNS_TOPIC_ARN']
-              sched = SCHEDULE.get(os.environ.get('DEFAULT_CRAWLER_SCHEDULE', 'disabled'))
-              chains = {**discover(b, v1), **{k: v for k, v in discover(b, v2).items() if k not in discover(b, v1)}}
-              dbs, crs, started = [], [], []
-              for c, path in chains.items():
-                  db, cr = c.lower(), f"{stack}-{c.upper()}-Crawler"
-                  try: glue.get_database(Name=db)
-                  except: glue.create_database(DatabaseInput={'Name': db, 'Description': f'[{stack}] {c.upper()}'}); dbs.append(db)
-                  try: glue.get_crawler(Name=cr)
-                  except:
-                      depth = len([x for x in path.replace('s3://', '').split('/') if x])
-                      cfg = {"Version": 1.0, "CrawlerOutput": {"Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}, "Tables": {"AddOrUpdateBehavior": "MergeNewColumns"}}}
-                      if depth > 4: cfg["Grouping"] = {"TableGroupingPolicy": "CombineCompatibleSchemas", "TableLevelConfiguration": depth}
-                      params = {'Name': cr, 'Role': role, 'DatabaseName': db, 'Targets': {'S3Targets': [{'Path': path, 'SampleSize': 10, 'Exclusions': ['**/*.xdr*', '**/*.json', '**/*.csv', '**/_*']}]}, 'SchemaChangePolicy': {'UpdateBehavior': 'LOG', 'DeleteBehavior': 'LOG'}, 'RecrawlPolicy': {'RecrawlBehavior': 'CRAWL_NEW_FOLDERS_ONLY'}, 'Configuration': json.dumps(cfg)}
-                      if sched: params['Schedule'] = sched
-                      glue.create_crawler(**params); crs.append(cr)
-                      if glue.get_crawler(Name=cr)['Crawler']['State'] == 'READY': glue.start_crawler(Name=cr); started.append(cr)
-              if dbs or crs: sns.publish(TopicArn=topic, Subject=f"Discovery: {len(chains)} chains", Message=f"DBs: {dbs}\nCrawlers: {crs}\nStarted: {started}")
-              return {'statusCode': 200, 'body': json.dumps({'chains': list(chains.keys()), 'dbs': dbs, 'crawlers': crs})}
+      Code: lambda/discovery/
 
   InitialDiscoveryFunction:
     Type: AWS::Lambda::Function
@@ -340,42 +261,7 @@ Resources:
       Handler: index.handler
       Role: !GetAtt InitialDiscoveryRole.Arn
       Timeout: 900
-      Code:
-        ZipFile: |
-          import boto3, json, time, urllib.request
-          lam, glue = boto3.client('lambda'), boto3.client('glue')
-          
-          def send_response(event, context, status, data, physical_id):
-              body = json.dumps({'Status': status, 'Reason': f'See CloudWatch Log Stream: {context.log_stream_name}', 'PhysicalResourceId': physical_id, 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data})
-              req = urllib.request.Request(event['ResponseURL'], data=body.encode('utf-8'), headers={'Content-Type': ''}, method='PUT')
-              urllib.request.urlopen(req)
-          
-          def cleanup(stack):
-              for cr in glue.list_crawlers().get('CrawlerNames', []):
-                  if cr.startswith(f"{stack}-"):
-                      try:
-                          if glue.get_crawler(Name=cr)['Crawler']['State'] == 'RUNNING': glue.stop_crawler(Name=cr); time.sleep(5)
-                          glue.delete_crawler(Name=cr)
-                      except: pass
-              for db in glue.get_databases().get('DatabaseList', []):
-                  if f'[{stack}]' in db.get('Description', ''):
-                      try:
-                          for t in glue.get_tables(DatabaseName=db['Name']).get('TableList', []): glue.delete_table(DatabaseName=db['Name'], Name=t['Name'])
-                          glue.delete_database(Name=db['Name'])
-                      except: pass
-          
-          def handler(event, context):
-              try:
-                  if event['RequestType'] == 'Create':
-                      lam.invoke(FunctionName=event['ResourceProperties']['DiscoveryFunctionName'], InvocationType='RequestResponse', Payload=json.dumps({}))
-                      send_response(event, context, 'SUCCESS', {'Result': 'OK'}, 'InitialDiscovery')
-                  elif event['RequestType'] == 'Delete':
-                      cleanup(event['ResourceProperties']['StackName'])
-                      send_response(event, context, 'SUCCESS', {'Result': 'Cleaned'}, 'InitialDiscovery')
-                  else: send_response(event, context, 'SUCCESS', {'Result': 'NoOp'}, 'InitialDiscovery')
-              except Exception as e:
-                  if event['RequestType'] == 'Delete': send_response(event, context, 'SUCCESS', {'Result': str(e)}, 'InitialDiscovery')
-                  else: send_response(event, context, 'FAILED', {'Error': str(e)}, 'InitialDiscovery')
+      Code: lambda/cleanup/
 
   CrawlerCompletionHandler:
     Type: AWS::Lambda::Function
@@ -390,68 +276,7 @@ Resources:
         Variables:
           SNS_TOPIC_ARN: !Ref CrawlerNotificationTopic
           S3_BUCKET: !Ref S3Bucket
-      Code:
-        ZipFile: |
-          import boto3, json, os
-          from datetime import datetime
-          glue, s3, sns = boto3.client('glue'), boto3.client('s3'), boto3.client('sns')
-          
-          def oldest_date(loc):
-              try:
-                  parts = loc.replace('s3://', '').split('/', 1)
-                  r = s3.list_objects_v2(Bucket=parts[0], Prefix=parts[1].rstrip('/')+'/date=', Delimiter='/', MaxKeys=1, RequestPayer='requester')
-                  for p in r.get('CommonPrefixes', []):
-                      f = p['Prefix'].rstrip('/').split('/')[-1]
-                      if f.startswith('date='): return f.split('=')[1]
-              except: pass
-              return None
-          
-          def dedupe(db, tbl):
-              try:
-                  t = glue.get_table(DatabaseName=db, Name=tbl)['Table']
-                  pkeys = {pk['Name'].lower() for pk in t.get('PartitionKeys', [])}
-                  if not pkeys: return None
-                  sd = t['StorageDescriptor']
-                  orig = sd.get('Columns', [])
-                  filt = [c for c in orig if c['Name'].lower() not in pkeys]
-                  removed = [c['Name'] for c in orig if c['Name'].lower() in pkeys]
-                  if not removed: return None
-                  inp = {'Name': t['Name'], 'StorageDescriptor': {**sd, 'Columns': filt}}
-                  for k in ['Description', 'Owner', 'Retention', 'PartitionKeys', 'TableType', 'Parameters']:
-                      if k in t: inp[k] = t[k]
-                  glue.update_table(DatabaseName=db, TableInput=inp)
-                  return removed
-              except: return None
-          
-          def add_proj(db, tbl):
-              try:
-                  t = glue.get_table(DatabaseName=db, Name=tbl)['Table']
-                  if 'date' not in [pk['Name'].lower() for pk in t.get('PartitionKeys', [])]: return None
-                  params = t.get('Parameters', {})
-                  if params.get('projection.enabled') == 'true': return None
-                  loc = t['StorageDescriptor']['Location'].rstrip('/')
-                  start = oldest_date(loc) or '2020-01-01'
-                  params.update({'projection.enabled': 'true', 'projection.date.type': 'date', 'projection.date.range': f'{start},NOW', 'projection.date.format': 'yyyy-MM-dd', 'projection.date.interval': '1', 'projection.date.interval.unit': 'DAYS', 'storage.location.template': f'{loc}/date=${{date}}'})
-                  inp = {'Name': t['Name'], 'StorageDescriptor': t['StorageDescriptor'], 'Parameters': params}
-                  for k in ['Description', 'Owner', 'Retention', 'PartitionKeys', 'TableType']:
-                      if k in t: inp[k] = t[k]
-                  glue.update_table(DatabaseName=db, TableInput=inp)
-                  return {'start': start}
-              except: return None
-          
-          def handler(event, context):
-              cr, state = event['detail']['crawlerName'], event['detail']['state']
-              if state != 'Succeeded': return {'statusCode': 200}
-              db = glue.get_crawler(Name=cr)['Crawler']['DatabaseName']
-              tables = [t for pg in glue.get_paginator('get_tables').paginate(DatabaseName=db) for t in pg.get('TableList', [])]
-              proj = {}
-              for t in tables:
-                  dedupe(db, t['Name'])
-                  r = add_proj(db, t['Name'])
-                  if r: proj[t['Name']] = r
-              msg = f"Crawler: {cr}\nDatabase: {db}\nTables: {len(tables)}\nProjection enabled: {list(proj.keys())}"
-              sns.publish(TopicArn=os.environ['SNS_TOPIC_ARN'], Subject=f"Crawler Complete: {cr}", Message=msg)
-              return {'statusCode': 200}
+      Code: lambda/completion/
 
   # ==========================================================================
   # EventBridge and Custom Resources
